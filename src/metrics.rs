@@ -1,17 +1,18 @@
 #[cfg(feature = "server")]
 use axum::{http::StatusCode, response::IntoResponse};
 #[cfg(feature = "server")]
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, histogram};
 #[cfg(feature = "server")]
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 #[cfg(feature = "server")]
-use std::sync::{Arc, OnceLock};
+use std::sync::{OnceLock, RwLock};
 #[cfg(feature = "server")]
-use tokio::sync::RwLock;
+use tracing::{info, warn};
 
-// Thread-safe, dynamic metrics handle
+/// Global Prometheus handle for rendering metrics
+/// Uses std::sync::RwLock (not tokio) since access is rare and brief
 #[cfg(feature = "server")]
-static PROMETHEUS_HANDLE: OnceLock<Arc<RwLock<Option<PrometheusHandle>>>> = OnceLock::new();
+static PROMETHEUS_HANDLE: OnceLock<RwLock<Option<PrometheusHandle>>> = OnceLock::new();
 
 #[cfg(feature = "server")]
 pub fn init_metrics() {
@@ -19,34 +20,29 @@ pub fn init_metrics() {
 
     match builder.install_recorder() {
         Ok(handle) => {
-            let handle_container = PROMETHEUS_HANDLE.get_or_init(|| {
-                Arc::new(RwLock::new(None))
-            });
+            // Initialize the handle container and set the handle synchronously
+            // No race condition - handle is ready before any metrics are recorded
+            let handle_container = PROMETHEUS_HANDLE.get_or_init(|| RwLock::new(None));
             
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    handle_container.write()
-                ).await {
-                    Ok(mut guard) => {
-                        *guard = Some(handle);
-                    },
-                    Err(_) => {
-                        eprintln!("Timeout setting up metrics handle");
-                    }
+            match handle_container.write() {
+                Ok(mut guard) => {
+                    *guard = Some(handle);
+                    info!("Prometheus metrics initialized");
                 }
-            });
+                Err(e) => {
+                    warn!("Failed to acquire metrics handle lock: {}", e);
+                }
+            }
 
             // Initialize metrics with zero values
             counter!("whois_requests_total", "tld" => "unknown").absolute(0);
             counter!("whois_cache_hits_total").absolute(0);
             counter!("whois_cache_misses_total").absolute(0);
             counter!("whois_errors_total", "error_type" => "unknown").absolute(0);
-            gauge!("whois_active_connections").set(0.0);
             histogram!("whois_request_duration_seconds").record(0.0);
         }
         Err(e) => {
-            eprintln!("Failed to install metrics recorder: {}", e);
+            warn!("Failed to install metrics recorder: {}", e);
         }
     }
 }
@@ -80,16 +76,20 @@ pub fn record_query_time(duration_ms: u64) {
 
 #[cfg(feature = "server")]
 pub async fn metrics_handler() -> impl IntoResponse {
-    let handle_container = PROMETHEUS_HANDLE.get_or_init(|| {
-        Arc::new(RwLock::new(None))
-    });
+    let handle_container = PROMETHEUS_HANDLE.get_or_init(|| RwLock::new(None));
     
-    let guard = handle_container.read().await;
-    if let Some(handle) = guard.as_ref() {
-        let metrics = handle.render();
-        (StatusCode::OK, metrics)
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "Metrics not initialized".to_string())
+    match handle_container.read() {
+        Ok(guard) => {
+            if let Some(handle) = guard.as_ref() {
+                let metrics = handle.render();
+                (StatusCode::OK, metrics)
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, "Metrics not initialized".to_string())
+            }
+        }
+        Err(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "Metrics lock poisoned".to_string())
+        }
     }
 }
 

@@ -8,24 +8,17 @@ use crate::{
     errors::WhoisError,
     ParsedWhoisData,
 };
-use once_cell::sync::{Lazy, OnceCell};
-use publicsuffix::{List, Psl};
+use once_cell::sync::Lazy;  // Used by include!(rdap_mappings.rs)
+use psl::Psl;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 use url::Url;
-
-// Global PSL instance - shared across all service instances
-static PSL: Lazy<Option<List>> = Lazy::new(|| {
-    match List::new() {
-        list => Some(list),
-    }
-});
 
 // RDAP Bootstrap Service URL for dynamic discovery
 const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
@@ -34,8 +27,11 @@ const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
 include!(concat!(env!("OUT_DIR"), "/rdap_mappings.rs"));
 
 pub struct RdapService {
+    config: Arc<Config>,
     client: reqwest::Client,
     tld_servers: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
+    /// Bootstrap cache using tokio::sync::OnceCell for proper async initialization
+    /// get_or_try_init prevents concurrent fetches - only one thread fetches, others wait
     bootstrap_cache: OnceCell<RdapBootstrap>,
     query_semaphore: Arc<Semaphore>,
     discovery_semaphore: Arc<Semaphore>,
@@ -117,6 +113,7 @@ impl RdapService {
             .map_err(|e| WhoisError::HttpError(e))?;
 
         let service = Self {
+            config: config.clone(),
             client,
             tld_servers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             bootstrap_cache: OnceCell::new(),
@@ -140,8 +137,8 @@ impl RdapService {
             return Err(WhoisError::InvalidDomain(domain));
         }
         
-        // Extract TLD from the domain using global PSL
-        let tld = self.extract_tld(&domain)?;
+        // Extract TLD from the domain using embedded PSL
+        let tld = Self::extract_tld(&domain)?;
         
         // Find appropriate RDAP server (hybrid: hardcoded + bootstrap discovery)
         let rdap_server = self.find_rdap_server(&tld).await?;
@@ -150,7 +147,7 @@ impl RdapService {
         let raw_data = self.query_rdap_server(&rdap_server, &domain).await?;
         
         // Parse RDAP JSON response into our standard format
-        let (parsed_data, parsing_analysis) = self.parse_rdap_response(&raw_data);
+        let (parsed_data, parsing_analysis) = Self::parse_rdap_response(&raw_data);
         
         Ok(RdapResult {
             server: rdap_server,
@@ -160,35 +157,23 @@ impl RdapService {
         })
     }
 
-    /// Extract TLD from domain using global PSL for accurate parsing
-    fn extract_tld(&self, domain: &str) -> Result<String, WhoisError> {
-        // Parse the domain using the global public suffix list
-        match PSL.as_ref() {
-            Some(psl) => {
-                match psl.domain(domain.as_bytes()) {
-                    Some(parsed_domain) => {
-                        // Get the public suffix (effective TLD)
-                        let suffix = parsed_domain.suffix();
-                        match std::str::from_utf8(suffix.as_bytes()) {
-                            Ok(tld) => Ok(tld.to_string()),
-                            Err(_) => Err(WhoisError::InvalidDomain(format!("Invalid UTF-8 in TLD for domain: {}", domain)))
-                        }
+    /// Extract TLD from domain using the embedded Public Suffix List
+    /// The `psl` crate contains an up-to-date embedded PSL, updated with each crate release
+    fn extract_tld(domain: &str) -> Result<String, WhoisError> {
+        // Use the psl crate's embedded public suffix list
+        match psl::List.suffix(domain.as_bytes()) {
+            Some(suffix) => {
+                match std::str::from_utf8(suffix.as_bytes()) {
+                    Ok(tld) => {
+                        debug!("PSL extracted TLD '{}' from domain '{}'", tld, domain);
+                        Ok(tld.to_string())
                     },
-                    None => {
-                        // Fallback to simple extraction if PSL parsing fails
-                        warn!("Public suffix parsing failed for {}, using fallback", domain);
-                        let parts: Vec<&str> = domain.split('.').collect();
-                        if parts.is_empty() {
-                            Err(WhoisError::InvalidDomain(format!("No TLD found in domain: {}", domain)))
-                        } else {
-                            Ok(parts[parts.len() - 1].to_string())
-                        }
-                    }
+                    Err(_) => Err(WhoisError::InvalidDomain(format!("Invalid UTF-8 in TLD for domain: {}", domain)))
                 }
             },
             None => {
-                // Fallback to simple extraction if PSL is not initialized
-                warn!("Public suffix list is not initialized, using fallback");
+                // Fallback to simple extraction for edge cases
+                debug!("PSL suffix not found for {}, using simple extraction", domain);
                 let parts: Vec<&str> = domain.split('.').collect();
                 if parts.is_empty() {
                     Err(WhoisError::InvalidDomain(format!("No TLD found in domain: {}", domain)))
@@ -200,19 +185,19 @@ impl RdapService {
     }
 
     async fn find_rdap_server(&self, tld: &str) -> Result<String, WhoisError> {
-        // Check cache first
+        // Check generated RDAP mappings first (instant lookup, no lock needed)
+        if let Some(server) = GENERATED_RDAP_SERVERS.get(tld) {
+            debug!("Using generated RDAP server for {}: {}", tld, server);
+            return Ok(server.to_string());
+        }
+
+        // Check cache for dynamically discovered servers
         {
             let servers = self.tld_servers.read().await;
             if let Some(server) = servers.get(tld) {
                 debug!("Using cached RDAP server for {}: {}", tld, server);
                 return Ok(server.clone());
             }
-        }
-
-        // Check generated RDAP mappings first (instant lookup for popular TLDs)
-        if let Some(server) = GENERATED_RDAP_SERVERS.get(tld) {
-            info!("Using generated RDAP server for {}: {}", tld, server);
-            return Ok(server.to_string());
         }
 
         // Dynamic discovery using IANA bootstrap service
@@ -231,23 +216,14 @@ impl RdapService {
     async fn discover_rdap_server_bootstrap(&self, tld: &str) -> Option<String> {
         debug!("Discovering RDAP server for TLD via bootstrap: {}", tld);
 
-        // Check if we have cached bootstrap data
-        let needs_refresh = {
-            self.bootstrap_cache.get().is_none()
-        };
-
-        // Fetch bootstrap data if needed
-        if needs_refresh {
-            if let Err(e) = self.fetch_bootstrap_data().await {
+        // Use get_or_try_init to safely handle concurrent initialization
+        // This prevents race conditions and panics from double-initialization
+        let bootstrap = match self.get_or_fetch_bootstrap().await {
+            Ok(data) => data,
+            Err(e) => {
                 warn!("Failed to fetch RDAP bootstrap data: {}", e);
                 return None;
             }
-        }
-
-        // Search bootstrap data for the TLD
-        let bootstrap = match self.bootstrap_cache.get() {
-            Some(data) => data,
-            None => return None,
         };
         
         for service in &bootstrap.services {
@@ -263,7 +239,15 @@ impl RdapService {
         None
     }
 
-    async fn fetch_bootstrap_data(&self) -> Result<(), WhoisError> {
+    /// Safely get or fetch bootstrap data using tokio's get_or_try_init
+    /// Only one thread fetches, others wait - prevents concurrent HTTP requests
+    async fn get_or_fetch_bootstrap(&self) -> Result<&RdapBootstrap, WhoisError> {
+        self.bootstrap_cache
+            .get_or_try_init(|| self.fetch_bootstrap_data())
+            .await
+    }
+
+    async fn fetch_bootstrap_data(&self) -> Result<RdapBootstrap, WhoisError> {
         debug!("Fetching RDAP bootstrap data from IANA");
 
         let _permit = self.discovery_semaphore.acquire().await
@@ -284,11 +268,8 @@ impl RdapService {
             .await
             .map_err(|e| WhoisError::HttpError(e))?;
 
-        // Cache the bootstrap data
-        self.bootstrap_cache.set(bootstrap_data).expect("Bootstrap cache should only be set once");
-
-        info!("Successfully fetched and cached RDAP bootstrap data");
-        Ok(())
+        info!("Successfully fetched RDAP bootstrap data");
+        Ok(bootstrap_data)
     }
 
     async fn query_rdap_server(&self, server: &str, domain: &str) -> Result<String, WhoisError> {
@@ -315,16 +296,28 @@ impl RdapService {
             return Err(WhoisError::Internal(format!("RDAP query failed with status: {}", response.status())));
         }
 
+        // Check content-length header before downloading (if available)
+        if let Some(content_length) = response.content_length() {
+            if content_length as usize > self.config.max_response_size {
+                return Err(WhoisError::ResponseTooLarge);
+            }
+        }
+
         let raw_data = response
             .text()
             .await
             .map_err(|e| WhoisError::HttpError(e))?;
 
+        // Check actual size (content-length might be missing or wrong)
+        if raw_data.len() > self.config.max_response_size {
+            return Err(WhoisError::ResponseTooLarge);
+        }
+
         debug!("RDAP response length: {} bytes", raw_data.len());
         Ok(raw_data)
     }
 
-    fn parse_rdap_response(&self, raw_data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
+    fn parse_rdap_response(raw_data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
         let mut analysis = Vec::new();
         analysis.push("=== RDAP PARSING ANALYSIS ===".to_string());
 
@@ -388,7 +381,7 @@ impl RdapService {
                             if roles.contains(&"registrar".to_string()) {
                                 // Extract registrar name from vCard if available
                                 if let Some(ref vcard) = entity.vcard_array {
-                                    if let Some(registrar_name) = self.extract_registrar_from_vcard(vcard) {
+                                    if let Some(registrar_name) = Self::extract_registrar_from_vcard(vcard) {
                                         parsed.registrar = Some(registrar_name);
                                     }
                                 }
@@ -396,10 +389,10 @@ impl RdapService {
                             
                             if roles.contains(&"registrant".to_string()) {
                                 if let Some(ref vcard) = entity.vcard_array {
-                                    if let Some(name) = self.extract_name_from_vcard(vcard) {
+                                    if let Some(name) = Self::extract_name_from_vcard(vcard) {
                                         parsed.registrant_name = Some(name);
                                     }
-                                    if let Some(email) = self.extract_email_from_vcard(vcard) {
+                                    if let Some(email) = Self::extract_email_from_vcard(vcard) {
                                         parsed.registrant_email = Some(email);
                                     }
                                 }
@@ -409,7 +402,7 @@ impl RdapService {
                 }
 
                 // Calculate date-based fields using the same logic as WHOIS parser
-                self.calculate_date_fields(&mut parsed);
+                Self::calculate_date_fields(&mut parsed);
 
                 analysis.push(format!("✓ RDAP JSON parsed successfully"));
                 analysis.push(format!("✓ Registrar: {}", parsed.registrar.as_ref().unwrap_or(&"NOT FOUND".to_string())));
@@ -429,12 +422,12 @@ impl RdapService {
         }
     }
 
-    fn calculate_date_fields(&self, parsed: &mut ParsedWhoisData) {
+    fn calculate_date_fields(parsed: &mut ParsedWhoisData) {
         let now = chrono::Utc::now();
         
         // Calculate created_ago (days since creation)
         if let Some(ref creation_date) = parsed.creation_date {
-            if let Some(created_dt) = self.parse_iso_date(creation_date) {
+            if let Some(created_dt) = Self::parse_iso_date(creation_date) {
                 let days_ago = (now - created_dt).num_days();
                 parsed.created_ago = Some(days_ago);
             }
@@ -442,7 +435,7 @@ impl RdapService {
         
         // Calculate updated_ago (days since last update)
         if let Some(ref updated_date) = parsed.updated_date {
-            if let Some(updated_dt) = self.parse_iso_date(updated_date) {
+            if let Some(updated_dt) = Self::parse_iso_date(updated_date) {
                 let days_ago = (now - updated_dt).num_days();
                 parsed.updated_ago = Some(days_ago);
             }
@@ -450,35 +443,38 @@ impl RdapService {
         
         // Calculate expires_in (days until expiration, negative if expired)
         if let Some(ref expiration_date) = parsed.expiration_date {
-            if let Some(expires_dt) = self.parse_iso_date(expiration_date) {
+            if let Some(expires_dt) = Self::parse_iso_date(expiration_date) {
                 let days_until = (expires_dt - now).num_days();
                 parsed.expires_in = Some(days_until);
             }
         }
     }
 
-    fn parse_iso_date(&self, date_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn parse_iso_date(date_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         // RDAP dates are typically ISO 8601 format
         chrono::DateTime::parse_from_rfc3339(date_str)
             .map(|dt| dt.with_timezone(&chrono::Utc))
             .ok()
     }
 
-    fn extract_registrar_from_vcard(&self, _vcard: &serde_json::Value) -> Option<String> {
+    fn extract_registrar_from_vcard(_vcard: &serde_json::Value) -> Option<String> {
         // vCard arrays in RDAP are complex - this is a simplified extraction
         // TODO: Implement proper vCard parsing if needed
+        debug!("vCard registrar extraction not yet implemented");
         None
     }
 
-    fn extract_name_from_vcard(&self, _vcard: &serde_json::Value) -> Option<String> {
+    fn extract_name_from_vcard(_vcard: &serde_json::Value) -> Option<String> {
         // vCard arrays in RDAP are complex - this is a simplified extraction
         // TODO: Implement proper vCard parsing if needed
+        debug!("vCard name extraction not yet implemented");
         None
     }
 
-    fn extract_email_from_vcard(&self, _vcard: &serde_json::Value) -> Option<String> {
+    fn extract_email_from_vcard(_vcard: &serde_json::Value) -> Option<String> {
         // vCard arrays in RDAP are complex - this is a simplified extraction
         // TODO: Implement proper vCard parsing if needed
+        debug!("vCard email extraction not yet implemented");
         None
     }
 } 

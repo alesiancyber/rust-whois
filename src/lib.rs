@@ -37,11 +37,6 @@ pub mod tld_mappings;
 pub mod buffer_pool;
 pub mod parser;
 
-// OpenAPI support (optional)
-#[cfg(feature = "openapi")]
-use utoipa::ToSchema;
-#[cfg(feature = "openapi")]
-use serde_json::json;
 
 // Re-export main types for easy access
 pub use whois::{WhoisService, WhoisResult};
@@ -126,7 +121,7 @@ impl WhoisClient {
     /// Create a new whois client with custom configuration
     pub async fn new_with_config(config: Arc<Config>) -> Result<Self, WhoisError> {
         let service = Arc::new(WhoisService::new(config.clone()).await?);
-        let cache = Self::initialize_cache(config)?;
+        let cache = Self::initialize_cache(config);
         
         Ok(Self { service, cache })
     }
@@ -139,13 +134,9 @@ impl WhoisClient {
         Ok(Self { service, cache: None })
     }
 
-    /// Initialize cache - follows SRP
-    fn initialize_cache(config: Arc<Config>) -> Result<Option<Arc<CacheService>>, WhoisError> {
-        let cache = Some(Arc::new(
-            CacheService::new(config)
-                .map_err(|e| WhoisError::CacheError(format!("Failed to initialize cache: {}", e)))?
-        ));
-        Ok(cache)
+    /// Initialize cache
+    fn initialize_cache(config: Arc<Config>) -> Option<Arc<CacheService>> {
+        Some(Arc::new(CacheService::new(config)))
     }
 
     // === Public API Methods ===
@@ -210,32 +201,20 @@ impl WhoisClient {
         Ok(normalized_domain)
     }
 
-    /// Check cache - follows SRP
+    /// Check cache for a cached response
     async fn check_cache(&self, domain: &str) -> Option<WhoisResponse> {
         if let Some(cache) = &self.cache {
-            match cache.get(domain).await {
-                Ok(Some(cached_result)) => {
-                    return Some(cached_result);
-                }
-                Ok(None) => {
-                    // Cache miss, continue to fresh lookup
-                }
-                Err(e) => {
-                    tracing::warn!("Cache read error for {}: {}", domain, e);
-                    // Continue to fresh lookup on cache error
-                }
-            }
+            // get() returns Option directly - cache operations are infallible
+            return cache.get(domain).await;
         }
         None
     }
 
-    /// Cache result - follows SRP
+    /// Cache result for future lookups
     async fn cache_result(&self, domain: &str, response: &WhoisResponse) {
         if let Some(cache) = &self.cache {
-            if let Err(e) = cache.set(domain, response).await {
-                tracing::warn!("Failed to cache result for {}: {}", domain, e);
-                // Don't fail the request for cache write errors
-            }
+            // set() is infallible - in-memory cache operations don't fail
+            cache.set(domain, response).await;
         }
     }
 

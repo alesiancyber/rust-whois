@@ -1,19 +1,20 @@
 use axum::{
-    extract::{Query, State, FromRequestParts},
+    extract::{Path, Query, State},
     response::Json,
     routing::{get, post},
     Router,
-    http::request::Parts,
 };
 
 #[cfg(feature = "openapi")]
 use utoipa::{OpenApi, ToSchema};
 #[cfg(feature = "openapi")]
 use utoipa_swagger_ui::SwaggerUi;
+use axum::error_handling::HandleErrorLayer;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
-use tower::ServiceBuilder;
+use tower::{ServiceBuilder, timeout::TimeoutLayer, BoxError};
 use tower_http::{
     cors::CorsLayer,
     trace::TraceLayer,
@@ -23,6 +24,7 @@ use tracing::{info, warn};
 
 // Constants to eliminate magic numbers
 const CACHE_WRITE_TIMEOUT_SECS: u64 = 5;
+const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 // Import from the library instead of local modules
 use whois_service::{
@@ -31,9 +33,10 @@ use whois_service::{
     cache::CacheService,
     config::Config,
     errors::WhoisError,
-    WhoisResponse,  // Use the library's WhoisResponse
-    ParsedWhoisData, // Import for OpenAPI schema
+    WhoisResponse,
 };
+#[cfg(feature = "openapi")]
+use whois_service::ParsedWhoisData;
 
 // Import metrics module locally (API-only)
 mod metrics;
@@ -77,79 +80,98 @@ pub struct AppState {
     whois_service: Arc<WhoisService>,
     rdap_service: Arc<RdapService>,
     cache_service: Arc<CacheService>,
-    config: Arc<Config>,
+    /// Application start time for uptime tracking
+    start_time: std::time::Instant,
 }
 
-// Domain validation extractor
+/// Result from a three-tier lookup (RDAP -> WHOIS)
+struct LookupResult {
+    /// The server that provided the response (e.g., "RDAP: rdap.verisign.com")
+    server: String,
+    /// Raw response data from the server
+    raw_data: String,
+    /// Parsed/structured whois data (if parsing succeeded)
+    parsed_data: Option<whois_service::ParsedWhoisData>,
+    /// Debug information about the parsing process
+    parsing_analysis: Vec<String>,
+}
+
+// Domain validation helper
 #[derive(Debug, Clone)]
 pub struct ValidatedDomain(pub String);
 
-#[axum::async_trait]
-impl<S> FromRequestParts<S> for ValidatedDomain
-where
-    S: Send + Sync,
-{
-    type Rejection = WhoisError;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        // Extract domain from path parameters
-        let domain = Self::extract_domain_from_path(parts.uri.path())?;
-        Self::validate_domain(domain)
-    }
-}
-
 impl ValidatedDomain {
-    // Separate concern: path extraction
-    fn extract_domain_from_path(path: &str) -> Result<String, WhoisError> {
-        // Handle /whois/debug/:domain
-        if let Some(domain_part) = path.strip_prefix("/whois/debug/") {
-            let domain = domain_part.split('/').next().unwrap_or("").to_string();
-            if !domain.is_empty() {
-                return Ok(domain);
-            }
-        }
-        
-        // Handle /whois/:domain
-        if let Some(domain_part) = path.strip_prefix("/whois/") {
-            let domain = domain_part.split('/').next().unwrap_or("").to_string();
-            if !domain.is_empty() {
-                return Ok(domain);
-            }
-        }
-        
-        Err(WhoisError::InvalidDomain("Domain not found in path".to_string()))
-    }
-
-    // Separate concern: domain validation
-    pub fn validate_domain(domain: String) -> Result<Self, WhoisError> {
+    /// Validate and normalize a domain name per RFC 1035 / RFC 5891
+    pub fn validate(domain: String) -> Result<Self, WhoisError> {
         let domain = domain.trim().to_lowercase();
         
+        // Check for empty domain
         if domain.is_empty() {
             metrics::increment_errors("invalid_domain");
             return Err(WhoisError::InvalidDomain("Empty domain".to_string()));
         }
         
+        // RFC 1035: Total domain length max 253 characters
         if domain.len() > 253 {
             metrics::increment_errors("domain_too_long");
             return Err(WhoisError::InvalidDomain("Domain name too long".to_string()));
         }
         
+        // Must have at least one dot (TLD required)
         if !domain.contains('.') {
             metrics::increment_errors("invalid_domain_format");
             return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
         }
         
-        // Add more sophisticated validation
+        // Check for invalid dot patterns
         if domain.contains("..") || domain.starts_with('.') || domain.ends_with('.') {
             metrics::increment_errors("invalid_domain_format");
             return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
         }
         
+        // Validate each label
+        for label in domain.split('.') {
+            Self::validate_label(label)?;
+        }
+        
         Ok(ValidatedDomain(domain))
     }
     
-    pub(crate) fn from_query_params(params: &WhoisQuery) -> Result<Self, WhoisError> {
-        Self::validate_domain(params.domain.clone())
+    /// Validate a single domain label per RFC 1035
+    fn validate_label(label: &str) -> Result<(), WhoisError> {
+        // RFC 1035: Labels must be 1-63 characters
+        if label.is_empty() || label.len() > 63 {
+            metrics::increment_errors("invalid_label_length");
+            return Err(WhoisError::InvalidDomain(
+                format!("Label '{}' has invalid length (must be 1-63 chars)", label)
+            ));
+        }
+        
+        // RFC 1035: Labels cannot start or end with hyphen
+        if label.starts_with('-') || label.ends_with('-') {
+            metrics::increment_errors("invalid_label_format");
+            return Err(WhoisError::InvalidDomain(
+                format!("Label '{}' cannot start or end with hyphen", label)
+            ));
+        }
+        
+        // RFC 1035: Labels can only contain alphanumeric and hyphens
+        // Exception: Allow punycode (xn--) for internationalized domain names
+        for ch in label.chars() {
+            if !ch.is_ascii_alphanumeric() && ch != '-' {
+                metrics::increment_errors("invalid_domain_chars");
+                return Err(WhoisError::InvalidDomain(
+                    format!("Invalid character '{}' in domain", ch)
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Validate domain from query parameters
+    pub(crate) fn from_query(params: &WhoisQuery) -> Result<Self, WhoisError> {
+        Self::validate(params.domain.clone())
     }
 }
 
@@ -160,6 +182,16 @@ struct WhoisQuery {
     /// Must be a valid, pre-parsed domain name
     #[cfg_attr(feature = "openapi", param(example = "google.com"))]
     domain: String,
+    #[serde(default)]
+    /// Skip cache if true
+    #[cfg_attr(feature = "openapi", param(default = false))]
+    fresh: bool,
+}
+
+/// Optional query params for path-based routes (domain comes from path)
+#[derive(Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+struct PathQueryParams {
     #[serde(default)]
     /// Skip cache if true
     #[cfg_attr(feature = "openapi", param(default = false))]
@@ -179,13 +211,13 @@ struct HealthResponse {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
+    // Initialize tracing (try_init won't panic if already initialized, e.g., in tests)
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG")
                 .unwrap_or_else(|_| "whois_service=info,tower_http=debug".into()),
         )
-        .init();
+        .try_init();
 
     // Load configuration
     let config = Arc::new(Config::load()?);
@@ -194,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize services
     let whois_service = Arc::new(WhoisService::new(config.clone()).await?);
     let rdap_service = Arc::new(RdapService::new(config.clone()).await?);
-    let cache_service = Arc::new(CacheService::new(config.clone())?);  // Handle cache initialization error
+    let cache_service = Arc::new(CacheService::new(config.clone()));
 
     // Initialize metrics
     metrics::init_metrics();
@@ -203,10 +235,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         whois_service,
         rdap_service,
         cache_service,
-        config: config.clone(),
+        start_time: std::time::Instant::now(),
     };
 
     // Build the application
+    #[allow(unused_mut)]
     let mut app = Router::new()
         .route("/whois", get(whois_lookup))
         .route("/whois", post(whois_lookup_post))
@@ -224,9 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Apply middleware layers AFTER all routes are added (including OpenAPI routes)
+    // Note: Layers are applied in reverse order (last added = first executed)
     let app = app.layer(
         ServiceBuilder::new()
             .layer(TraceLayer::new_for_http())
+            .layer(HandleErrorLayer::new(handle_timeout_error))
+            .layer(TimeoutLayer::new(Duration::from_secs(REQUEST_TIMEOUT_SECS)))
             .layer(CompressionLayer::new())
             .layer(CorsLayer::permissive())
             .into_inner(),
@@ -261,17 +297,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn three_tier_lookup(
     state: &AppState,
     domain: &str,
-) -> Result<(String, String, Option<whois_service::ParsedWhoisData>, Vec<String>), WhoisError> {
+) -> Result<LookupResult, WhoisError> {
     // Tier 1: Try RDAP first (modern, structured JSON)
     match state.rdap_service.lookup(domain).await {
         Ok(rdap_result) => {
             info!("✓ RDAP lookup successful for {}", domain);
-            return Ok((
-                format!("RDAP: {}", rdap_result.server), 
-                rdap_result.raw_data,
-                rdap_result.parsed_data,
-                rdap_result.parsing_analysis,
-            ));
+            return Ok(LookupResult {
+                server: format!("RDAP: {}", rdap_result.server),
+                raw_data: rdap_result.raw_data,
+                parsed_data: rdap_result.parsed_data,
+                parsing_analysis: rdap_result.parsing_analysis,
+            });
         }
         Err(e) => {
             info!("⚠ RDAP lookup failed for {}: {} - falling back to WHOIS", domain, e);
@@ -282,18 +318,56 @@ async fn three_tier_lookup(
     match state.whois_service.lookup(domain).await {
         Ok(whois_result) => {
             info!("✓ WHOIS lookup successful for {}", domain);
-            Ok((
-                format!("WHOIS: {}", whois_result.server),
-                whois_result.raw_data,
-                whois_result.parsed_data,  
-                whois_result.parsing_analysis,
-            ))
+            Ok(LookupResult {
+                server: format!("WHOIS: {}", whois_result.server),
+                raw_data: whois_result.raw_data,
+                parsed_data: whois_result.parsed_data,
+                parsing_analysis: whois_result.parsing_analysis,
+            })
         }
         Err(e) => {
             warn!("❌ Both RDAP and WHOIS lookups failed for {}", domain);
             Err(e)
         }
     }
+}
+
+/// Core lookup logic - takes pre-validated domain to avoid double validation
+async fn perform_whois_lookup(
+    state: &AppState,
+    domain: String,
+    fresh: bool,
+    include_debug: bool,
+) -> Result<Json<WhoisResponse>, WhoisError> {
+    let start_time = std::time::Instant::now();
+    
+    // Increment request counter
+    metrics::increment_requests(&domain);
+
+    // Check cache first (unless fresh is requested)
+    if !fresh {
+        if let Some(cached_result) = check_cache(&state.cache_service, &domain).await {
+            metrics::increment_cache_hits();
+            return Ok(Json(cached_result));
+        }
+    }
+
+    // Perform three-tier lookup
+    let result = three_tier_lookup(state, &domain).await?;
+    
+    let query_time = start_time.elapsed().as_millis() as u64;
+    
+    let response = build_whois_response(domain.clone(), result, query_time, include_debug);
+
+    // Cache the result (with error handling) - skip for debug requests
+    if !include_debug {
+        handle_cache_write(&state.cache_service, &domain, &response).await;
+        metrics::increment_cache_misses();
+    }
+    
+    metrics::record_query_time(query_time);
+
+    Ok(Json(response))
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -311,51 +385,18 @@ async fn whois_lookup(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let start_time = std::time::Instant::now();
-    
-    // Validate domain using centralized validation
-    let validated_domain = ValidatedDomain::from_query_params(&params)?;
-    let domain = validated_domain.0;
-    
-    // Increment request counter
-    metrics::increment_requests(&domain);
-
-    // Check cache first (unless fresh is requested)
-    if !params.fresh {
-        if let Some(cached_result) = check_cache(&state.cache_service, &domain).await {
-            metrics::increment_cache_hits();
-            return Ok(Json(cached_result));
-        }
-    }
-
-    // Perform three-tier lookup
-    let result = three_tier_lookup(&state, &domain).await?;
-    
-    let query_time = start_time.elapsed().as_millis() as u64;
-    
-    let response = build_whois_response(domain.clone(), result, query_time, false);
-
-    // Cache the result (with error handling)
-    handle_cache_write(&state.cache_service, &domain, &response).await;
-    
-    metrics::record_query_time(query_time);
-    metrics::increment_cache_misses();
-
-    Ok(Json(response))
+    let validated = ValidatedDomain::from_query(&params)?;
+    perform_whois_lookup(&state, validated.0, params.fresh, false).await
 }
 
-// Helper function to handle cache writes - follows SRP
+// Helper function to handle cache writes with timeout
 async fn handle_cache_write(cache_service: &CacheService, domain: &str, response: &WhoisResponse) {
     match tokio::time::timeout(
         std::time::Duration::from_secs(CACHE_WRITE_TIMEOUT_SECS),
         cache_service.set(domain, response)
     ).await {
-        Ok(Ok(())) => {
+        Ok(()) => {
             // Cache write successful
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("Failed to cache result for {}: {}", domain, e);
-            metrics::increment_errors("cache_write_error");
         }
         Err(_) => {
             tracing::warn!("Cache write timeout for {}", domain);
@@ -367,18 +408,18 @@ async fn handle_cache_write(cache_service: &CacheService, domain: &str, response
 // Helper function to build WhoisResponse - eliminates DRY violation
 fn build_whois_response(
     domain: String,
-    result: (String, String, Option<whois_service::ParsedWhoisData>, Vec<String>),
+    result: LookupResult,
     query_time: u64,
     include_debug: bool,
 ) -> WhoisResponse {
     WhoisResponse {
         domain,
-        whois_server: result.0,
-        raw_data: result.1,
-        parsed_data: result.2,
+        whois_server: result.server,
+        raw_data: result.raw_data,
+        parsed_data: result.parsed_data,
         cached: false,
         query_time_ms: query_time,
-        parsing_analysis: if include_debug { Some(result.3) } else { None },
+        parsing_analysis: if include_debug { Some(result.parsing_analysis) } else { None },
     }
 }
 
@@ -404,25 +445,9 @@ async fn whois_debug(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let start_time = std::time::Instant::now();
-    
-    // Validate domain using centralized validation
-    let validated_domain = ValidatedDomain::from_query_params(&params)?;
-    let domain = validated_domain.0;
-    
-    // Increment request counter
-    metrics::increment_requests(&domain);
-
-    // Always perform fresh lookup for debug (no cache)
-    let result = three_tier_lookup(&state, &domain).await?;
-    
-    let query_time = start_time.elapsed().as_millis() as u64;
-    
-    let response = build_whois_response(domain, result, query_time, true);
-
-    metrics::record_query_time(query_time);
-
-    Ok(Json(response))
+    let validated = ValidatedDomain::from_query(&params)?;
+    // Debug always uses fresh lookup (ignore params.fresh, always true)
+    perform_whois_lookup(&state, validated.0, true, true).await
 }
 
 // Path-based whois lookup for easier testing
@@ -430,7 +455,8 @@ async fn whois_debug(
     get,
     path = "/whois/{domain}",
     params(
-        ("domain" = String, Path, description = "Domain name to lookup", example = "google.com")
+        ("domain" = String, Path, description = "Domain name to lookup", example = "google.com"),
+        PathQueryParams
     ),
     responses(
         (status = 200, description = "Whois lookup successful", body = WhoisResponse),
@@ -440,14 +466,16 @@ async fn whois_debug(
     tag = "whois"
 ))]
 async fn whois_lookup_path(
-    validated_domain: ValidatedDomain,
+    Path(domain): Path<String>,
+    Query(params): Query<PathQueryParams>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let query = WhoisQuery { domain: validated_domain.0, fresh: false };
-    whois_lookup(Query(query), State(state)).await
+    let validated = ValidatedDomain::validate(domain)?;
+    perform_whois_lookup(&state, validated.0, params.fresh, false).await
 }
 
 // Path-based debug lookup for easier testing
+// Note: Debug always uses fresh lookup regardless of params.fresh
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/whois/debug/{domain}",
@@ -462,11 +490,12 @@ async fn whois_lookup_path(
     tag = "whois"
 ))]
 async fn whois_debug_path(
-    validated_domain: ValidatedDomain,
+    Path(domain): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let query = WhoisQuery { domain: validated_domain.0, fresh: false };
-    whois_debug(Query(query), State(state)).await
+    let validated = ValidatedDomain::validate(domain)?;
+    // Debug always uses fresh lookup (cache bypass)
+    perform_whois_lookup(&state, validated.0, true, true).await
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(
@@ -481,23 +510,33 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
-        uptime_seconds: state.config.start_time.elapsed().as_secs(),
+        uptime_seconds: state.start_time.elapsed().as_secs(),
     })
 }
 
-// Helper function to check cache - eliminates DRY violation
+// Helper function to check cache
 async fn check_cache(cache_service: &CacheService, domain: &str) -> Option<WhoisResponse> {
-    match cache_service.get(domain).await {
-        Ok(Some(cached_result)) => Some(cached_result),
-        Ok(None) => {
-            // Cache miss, continue to fresh lookup
-            None
-        }
-        Err(e) => {
-            tracing::warn!("Cache read error for {}: {}", domain, e);
-            metrics::increment_errors("cache_read_error");
-            // Continue to fresh lookup on cache error
-            None
-        }
-    }
+    // get() returns Option directly - cache operations are infallible
+    cache_service.get(domain).await
+}
+
+// Handle request timeout errors - matches WhoisError JSON format
+async fn handle_timeout_error(err: BoxError) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    
+    let (status, message) = if err.is::<tower::timeout::error::Elapsed>() {
+        metrics::increment_errors("request_timeout");
+        (StatusCode::REQUEST_TIMEOUT, "Request timed out")
+    } else {
+        metrics::increment_errors("internal_error");
+        (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
+    };
+    
+    // Match the JSON format from WhoisError::into_response
+    let body = Json(serde_json::json!({
+        "error": message,
+        "status": status.as_u16()
+    }));
+    
+    (status, body).into_response()
 } 

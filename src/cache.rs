@@ -8,39 +8,47 @@ pub struct CacheService {
 }
 
 impl CacheService {
-    pub fn new(config: Arc<Config>) -> Result<Self, String> {
+    /// Create a new cache service with the given configuration.
+    /// 
+    /// Note: This cannot fail - moka cache creation is infallible.
+    #[must_use]
+    pub fn new(config: Arc<Config>) -> Self {
         let cache = Cache::builder()
             .max_capacity(config.cache_max_entries)
             .time_to_live(Duration::from_secs(config.cache_ttl_seconds))
             .build();
 
-        Ok(Self { cache })
+        Self { cache }
     }
 
-    pub async fn get(&self, domain: &str) -> Result<Option<WhoisResponse>, String> {
-        let key = self.normalize_domain(domain);
+    /// Get a cached response for a domain.
+    /// 
+    /// Returns `Some(response)` with `cached=true` if found, `None` otherwise.
+    pub async fn get(&self, domain: &str) -> Option<WhoisResponse> {
+        let key = Self::normalize_domain(domain);
         
         match self.cache.get(&key).await {
             Some(mut response) => {
                 debug!("Cache hit for domain: {}", domain);
                 response.cached = true;
-                Ok(Some(response))
+                Some(response)
             },
             None => {
                 debug!("Cache miss for domain: {}", domain);
-                Ok(None)
+                None
             }
         }
     }
 
-    pub async fn set(&self, domain: &str, response: &WhoisResponse) -> Result<(), String> {
-        let key = self.normalize_domain(domain);
+    /// Store a response in the cache.
+    pub async fn set(&self, domain: &str, response: &WhoisResponse) {
+        let key = Self::normalize_domain(domain);
         self.cache.insert(key, response.clone()).await;
         debug!("Cached response for domain: {}", domain);
-        Ok(())
     }
 
-    fn normalize_domain(&self, domain: &str) -> String {
+    /// Normalize domain for consistent cache keys.
+    fn normalize_domain(domain: &str) -> String {
         let normalized = domain.trim().to_lowercase();
         
         // Remove trailing dot if present (common in DNS contexts)

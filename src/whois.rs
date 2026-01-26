@@ -4,10 +4,9 @@ use crate::{
     ParsedWhoisData,
     tld_mappings::HARDCODED_TLD_SERVERS,
     buffer_pool::{BufferPool, PooledBuffer},
-    parser::WhoisParser,
+    parser::WhoisParser,  // Used for associated function calls
 };
-use once_cell::sync::Lazy;
-use publicsuffix::{List, Psl};
+use psl::Psl;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -21,11 +20,19 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-// Global PSL instance - shared across all service instances
-static PSL: Lazy<List> = Lazy::new(|| List::new());
-
 // Standard whois protocol port
 const WHOIS_PORT: u16 = 43;
+
+/// Maximum timeout for server discovery/connectivity tests (seconds)
+/// Kept short since we're just testing if a server is reachable
+const MAX_DISCOVERY_TIMEOUT_SECS: u64 = 10;
+
+/// Multiplier for total read timeout vs individual read timeout
+/// Prevents slow-loris attacks while allowing legitimate slow connections
+const TOTAL_TIMEOUT_MULTIPLIER: u64 = 2;
+
+/// Root WHOIS servers for TLD discovery (IANA is authoritative)
+const ROOT_WHOIS_SERVERS: &[&str] = &["whois.iana.org"];
 
 pub struct WhoisService {
     config: Arc<Config>,
@@ -33,7 +40,6 @@ pub struct WhoisService {
     domain_query_semaphore: Arc<Semaphore>,  // For actual domain lookups
     discovery_semaphore: Arc<Semaphore>,     // For TLD discovery (higher limit)
     buffer_pool: BufferPool,  // Reusable buffers for network I/O
-    parser: WhoisParser,      // Whois data parser
 }
 
 pub struct WhoisResult {
@@ -51,7 +57,6 @@ impl WhoisService {
             domain_query_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries)),
             discovery_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries * 2)),
             buffer_pool: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(config.buffer_pool_size))),
-            parser: WhoisParser::new(),
         };
 
         info!("WhoisService initialized with hybrid TLD discovery (hardcoded + dynamic)");
@@ -62,17 +67,12 @@ impl WhoisService {
     }
 
     /// Perform whois lookup for a domain
-    /// Assumes domain is already validated and properly formatted (e.g., "example.com")
+    /// Assumes domain is already validated by the API layer (ValidatedDomain)
     pub async fn lookup(&self, domain: &str) -> Result<WhoisResult, WhoisError> {
         let domain = domain.trim().to_lowercase();
         
-        // Basic validation - assume domain is pre-parsed and valid
-        if domain.is_empty() || !domain.contains('.') {
-            return Err(WhoisError::InvalidDomain(domain));
-        }
-        
-        // Extract TLD from the domain using global PSL
-        let tld = self.extract_tld(&domain)?;
+        // Extract TLD from the domain using embedded PSL
+        let tld = Self::extract_tld(&domain)?;
         
         // Find appropriate whois server (hybrid: hardcoded + dynamic discovery)
         let whois_server = self.find_whois_server(&tld).await?;
@@ -84,35 +84,39 @@ impl WhoisService {
         let (final_server, final_data) = self.follow_referrals(&whois_server, &raw_data, &domain).await?;
         
         // Parse the whois data with detailed analysis
-        let (parsed_data, parsing_analysis) = self.parser.parse_whois_data_with_analysis(&final_data);
+        let (parsed_data, parsing_analysis) = WhoisParser::parse_whois_data_with_analysis(&final_data);
         
         Ok(WhoisResult {
             server: final_server,
             raw_data: final_data,
-            parsed_data,
+            parsed_data: Some(parsed_data),
             parsing_analysis,
         })
     }
 
-    /// Extract TLD from domain using global PSL for accurate parsing
-    fn extract_tld(&self, domain: &str) -> Result<String, WhoisError> {
-        // Parse the domain using the global public suffix list
-        match PSL.domain(domain.as_bytes()) {
-            Some(parsed_domain) => {
-                // Get the public suffix (effective TLD)
-                let suffix = parsed_domain.suffix();
+    /// Extract TLD from domain using the embedded Public Suffix List
+    /// The `psl` crate contains an up-to-date embedded PSL, updated with each crate release
+    fn extract_tld(domain: &str) -> Result<String, WhoisError> {
+        // Use the psl crate's embedded public suffix list
+        match psl::List.suffix(domain.as_bytes()) {
+            Some(suffix) => {
                 match std::str::from_utf8(suffix.as_bytes()) {
-                    Ok(tld) => Ok(tld.to_string()),
+                    Ok(tld) => {
+                        debug!("PSL extracted TLD '{}' from domain '{}'", tld, domain);
+                        Ok(tld.to_string())
+                    },
                     Err(_) => Err(WhoisError::InvalidDomain(format!("Invalid UTF-8 in TLD for domain: {}", domain)))
                 }
             },
             None => {
-                // Fallback to simple extraction if PSL parsing fails
-                warn!("Public suffix parsing failed for {}, using fallback", domain);
+                // Fallback for edge cases (should be rare with proper PSL)
+                // This handles malformed domains or very new TLDs not yet in PSL
+                warn!("PSL suffix not found for '{}', falling back to simple extraction", domain);
                 let parts: Vec<&str> = domain.split('.').collect();
-                if parts.is_empty() {
+                if parts.len() < 2 {
                     Err(WhoisError::InvalidDomain(format!("No TLD found in domain: {}", domain)))
                 } else {
+                    // Return just the last segment as TLD
                     Ok(parts[parts.len() - 1].to_string())
                 }
             }
@@ -120,19 +124,19 @@ impl WhoisService {
     }
 
     async fn find_whois_server(&self, tld: &str) -> Result<String, WhoisError> {
-        // Check cache first
+        // Check hardcoded TLD mappings first (instant lookup, no lock needed)
+        if let Some(server) = HARDCODED_TLD_SERVERS.get(tld) {
+            debug!("Using hardcoded whois server for {}: {}", tld, server);
+            return Ok(server.to_string());
+        }
+
+        // Check cache for dynamically discovered servers
         {
             let servers = self.tld_servers.read().await;
             if let Some(server) = servers.get(tld) {
                 debug!("Using cached whois server for {}: {}", tld, server);
                 return Ok(server.clone());
             }
-        }
-
-        // Check hardcoded TLD mappings first (instant lookup for popular TLDs)
-        if let Some(server) = HARDCODED_TLD_SERVERS.get(tld) {
-            info!("Using hardcoded whois server for {}: {}", tld, server);
-            return Ok(server.to_string());
         }
 
         // Dynamic discovery for uncommon/new TLDs
@@ -162,7 +166,7 @@ impl WhoisService {
         }
 
         // Strategy 2: Try common patterns with connectivity testing only
-        let patterns = self.generate_whois_patterns(tld);
+        let patterns = Self::generate_whois_patterns(tld);
         for pattern in patterns {
             debug!("Testing pattern server: {}", pattern);
             if self.test_whois_server(&pattern).await {
@@ -175,7 +179,7 @@ impl WhoisService {
         None
     }
 
-    fn generate_whois_patterns(&self, tld: &str) -> Vec<String> {
+    fn generate_whois_patterns(tld: &str) -> Vec<String> {
         // Intelligent pattern generation based on TLD characteristics
         let mut patterns = Vec::new();
         
@@ -198,16 +202,14 @@ impl WhoisService {
     }
 
     async fn query_root_servers_for_tld(&self, tld: &str) -> Option<String> {
-        let root_servers = self.get_root_servers();
-
-        for root_server in &root_servers {
+        for root_server in Self::get_root_servers() {
             debug!("Querying root server {} for TLD: {}", root_server, tld);
             
             match self.discovery_whois_query(root_server, tld).await {
                 Ok(response) => {
                     debug!("Root server {} response length: {} bytes", root_server, response.len());
                     
-                    if let Some(server) = self.parse_root_server_response(&response) {
+                    if let Some(server) = Self::parse_root_server_response(&response) {
                         return Some(server);
                     }
                     
@@ -222,48 +224,48 @@ impl WhoisService {
         None
     }
 
-    fn parse_root_server_response(&self, response: &str) -> Option<String> {
+    fn parse_root_server_response(response: &str) -> Option<String> {
         // Parse the response line by line to find referral
         for line in response.lines() {
             let line = line.trim();
             
             // Check for various whois server line formats
-            if let Some(server) = self.extract_server_from_line(line) {
+            if let Some(server) = Self::extract_server_from_line(line) {
                 return Some(server);
             }
         }
         
-        // Fallback: try the regex approach
-        if let Some(server) = self.extract_whois_server(response) {
-            debug!("Found referral server via regex: {}", server);
+        // Fallback: try key-value parsing for other referral formats
+        if let Some(server) = Self::extract_whois_server(response) {
+            debug!("Found referral server via key-value parsing: {}", server);
             return Some(server);
         }
         
         None
     }
 
-    fn extract_server_from_line(&self, line: &str) -> Option<String> {
+    fn extract_server_from_line(line: &str) -> Option<String> {
         let line_lower = line.to_lowercase();
         
         // Look for "whois:" lines (IANA format)
         if line_lower.starts_with("whois:") {
-            return self.extract_server_after_colon(line, "whois server");
+            return Self::extract_server_after_colon(line, "whois server");
         }
         
         // Look for "refer:" lines (alternative format)
         if line_lower.starts_with("refer:") {
-            return self.extract_server_after_colon(line, "refer server");
+            return Self::extract_server_after_colon(line, "refer server");
         }
         
         // Look for "whois server:" lines (alternative format)
         if line_lower.contains("whois server:") {
-            return self.extract_server_after_colon(line, "whois server");
+            return Self::extract_server_after_colon(line, "whois server");
         }
         
         None
     }
 
-    fn extract_server_after_colon(&self, line: &str, server_type: &str) -> Option<String> {
+    fn extract_server_after_colon(line: &str, server_type: &str) -> Option<String> {
         if let Some(server) = line.split(':').nth(1) {
             let server = server.trim().to_string();
             
@@ -279,16 +281,13 @@ impl WhoisService {
         None
     }
 
-    fn get_root_servers(&self) -> Vec<String> {
-        // Root whois servers - IANA is the authoritative source
-        vec![
-            "whois.iana.org".to_string(),
-        ]
+    fn get_root_servers() -> &'static [&'static str] {
+        ROOT_WHOIS_SERVERS
     }
 
     async fn test_whois_server(&self, server: &str) -> bool {
         match timeout(
-            Duration::from_secs(self.config.discovery_timeout_seconds.min(10)), 
+            Duration::from_secs(self.config.discovery_timeout_seconds.min(MAX_DISCOVERY_TIMEOUT_SECS)), 
             TcpStream::connect((server, WHOIS_PORT))
         ).await {
             Ok(Ok(_)) => {
@@ -355,20 +354,29 @@ impl WhoisService {
 
     async fn read_whois_response(&self, stream: &mut TcpStream) -> Result<String, WhoisError> {
         // Get RAII buffer from pool - automatically returns on drop
-        let mut pooled_buffer = PooledBuffer::new(
+        // Uses DerefMut for ergonomic access via &mut *buffer
+        let mut buffer = PooledBuffer::new(
             self.buffer_pool.clone(), 
             self.config.buffer_size, 
             self.config.buffer_pool_size
         );
-        let buffer = pooled_buffer.as_mut();
 
-        // Read response
+        // Read response with total timeout to prevent slow-loris attacks
+        // (individual read timeouts could be bypassed by sending 1 byte per timeout period)
         let mut response = Vec::new();
+        let read_start = std::time::Instant::now();
+        let total_timeout = Duration::from_secs(self.config.whois_timeout_seconds * TOTAL_TIMEOUT_MULTIPLIER);
         
         loop {
+            // Check total elapsed time
+            if read_start.elapsed() > total_timeout {
+                warn!("Total read timeout exceeded for whois response");
+                return Err(WhoisError::Timeout);
+            }
+            
             match timeout(
                 Duration::from_secs(self.config.whois_timeout_seconds),
-                stream.read(buffer)
+                stream.read(&mut *buffer)
             ).await? {
                 Ok(0) => break, // EOF
                 Ok(n) => {
@@ -394,7 +402,7 @@ impl WhoisService {
         let max_referrals = self.config.max_referrals;
 
         while referral_count < max_referrals {
-            if let Some(referral_server) = self.extract_whois_server(&current_data) {
+            if let Some(referral_server) = Self::extract_whois_server(&current_data) {
                 if referral_server != current_server {
                     debug!("Following referral from {} to {}", current_server, referral_server);
                     
@@ -418,7 +426,7 @@ impl WhoisService {
         Ok((current_server, current_data))
     }
 
-    fn extract_whois_server(&self, data: &str) -> Option<String> {
+    fn extract_whois_server(data: &str) -> Option<String> {
         for line in data.lines() {
             let line = line.trim();
             if let Some((key, value)) = line.split_once(':') {

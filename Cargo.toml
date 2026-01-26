@@ -44,7 +44,7 @@ futures = "0.3"
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 dotenvy = "0.15"
-publicsuffix = "2.2"
+psl = "2.1"  # Has embedded PSL data, updated with crate releases
 once_cell = "1.19"
 moka = { version = "0.12", features = ["future"] }
 url = "2.5"

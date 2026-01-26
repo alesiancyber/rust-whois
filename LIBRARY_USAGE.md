@@ -362,11 +362,16 @@ pub struct ParsedWhoisData {
 
 ```rust
 pub enum WhoisError {
-    InvalidDomain(String),
-    UnsupportedTld(String),
-    Timeout,
-    IoError(std::io::Error),
-    ParseError(String),
+    InvalidDomain(String),    // Domain validation failed
+    UnsupportedTld(String),   // TLD not supported
+    Timeout,                  // Network timeout
+    ResponseTooLarge,         // Response exceeded size limit
+    InvalidUtf8,              // Non-UTF8 response from server
+    IoError(tokio::io::Error),
+    HttpError(reqwest::Error),
+    RegexError(regex::Error),
+    ConfigError(config::ConfigError),
+    Internal(String),
 }
 ```
 

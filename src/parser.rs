@@ -2,14 +2,19 @@ use crate::ParsedWhoisData;
 use chrono::{DateTime, Utc, NaiveDateTime};
 use tracing::debug;
 
+/// Stateless WHOIS response parser
+/// 
+/// All methods are associated functions since parsing is pure computation.
 pub struct WhoisParser;
 
 impl WhoisParser {
+    #[must_use]
     pub fn new() -> Self {
         Self
     }
 
-    pub fn parse_whois_data(&self, data: &str) -> Option<ParsedWhoisData> {
+    /// Parse raw WHOIS data into structured fields
+    pub fn parse_whois_data(data: &str) -> ParsedWhoisData {
         let mut parsed = ParsedWhoisData {
             registrar: None,
             creation_date: None,
@@ -116,53 +121,53 @@ impl WhoisParser {
         }
 
         // Calculate date-based fields
+        Self::calculate_date_fields(&mut parsed);
+
+        parsed
+    }
+
+    /// Calculate relative date fields (days ago, days until expiry)
+    fn calculate_date_fields(parsed: &mut ParsedWhoisData) {
         let now = Utc::now();
         
         // Calculate created_ago (days since creation)
         if let Some(ref creation_date) = parsed.creation_date {
-            if let Some(created_dt) = self.parse_date(creation_date) {
-                let days_ago = (now - created_dt).num_days();
-                parsed.created_ago = Some(days_ago);
+            if let Some(created_dt) = Self::parse_date(creation_date) {
+                parsed.created_ago = Some((now - created_dt).num_days());
             }
         }
         
         // Calculate updated_ago (days since last update)
         if let Some(ref updated_date) = parsed.updated_date {
-            if let Some(updated_dt) = self.parse_date(updated_date) {
-                let days_ago = (now - updated_dt).num_days();
-                parsed.updated_ago = Some(days_ago);
+            if let Some(updated_dt) = Self::parse_date(updated_date) {
+                parsed.updated_ago = Some((now - updated_dt).num_days());
             }
         }
         
         // Calculate expires_in (days until expiration, negative if expired)
         if let Some(ref expiration_date) = parsed.expiration_date {
-            if let Some(expires_dt) = self.parse_date(expiration_date) {
-                let days_until = (expires_dt - now).num_days();
-                parsed.expires_in = Some(days_until);
+            if let Some(expires_dt) = Self::parse_date(expiration_date) {
+                parsed.expires_in = Some((expires_dt - now).num_days());
             }
         }
-
-        Some(parsed)
     }
 
-    pub fn parse_whois_data_with_analysis(&self, data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
+    /// Parse WHOIS data and return detailed analysis for debugging
+    pub fn parse_whois_data_with_analysis(data: &str) -> (ParsedWhoisData, Vec<String>) {
         let mut analysis = Vec::new();
         
         // Parse the data
-        let parsed_data = self.parse_whois_data(data);
+        let parsed = Self::parse_whois_data(data);
         
         // Analyze what was found
         analysis.push("=== PARSING ANALYSIS ===".to_string());
-        
-        if let Some(ref parsed) = parsed_data {
-            analysis.push(format!("✓ Registrar: {}", parsed.registrar.as_ref().unwrap_or(&"NOT FOUND".to_string())));
-            analysis.push(format!("✓ Creation Date: {}", parsed.creation_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
-            analysis.push(format!("✓ Expiration Date: {}", parsed.expiration_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
-            analysis.push(format!("✓ Updated Date: {}", parsed.updated_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
-            analysis.push(format!("✓ Registrant Name: {}", parsed.registrant_name.as_ref().unwrap_or(&"NOT FOUND".to_string())));
-            analysis.push(format!("✓ Name Servers: {} found", parsed.name_servers.len()));
-            analysis.push(format!("✓ Status: {} found", parsed.status.len()));
-        }
+        analysis.push(format!("✓ Registrar: {}", parsed.registrar.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("✓ Creation Date: {}", parsed.creation_date.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("✓ Expiration Date: {}", parsed.expiration_date.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("✓ Updated Date: {}", parsed.updated_date.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("✓ Registrant Name: {}", parsed.registrant_name.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("✓ Name Servers: {} found", parsed.name_servers.len()));
+        analysis.push(format!("✓ Status: {} found", parsed.status.len()));
         
         // Show lines that might contain registrant info
         analysis.push("\n=== LINES CONTAINING 'REGISTRANT' ===".to_string());
@@ -180,19 +185,23 @@ impl WhoisParser {
             }
         }
         
-        (parsed_data, analysis)
+        (parsed, analysis)
     }
 
-    /// Parse various date formats commonly found in whois data
-    fn parse_date(&self, date_str: &str) -> Option<DateTime<Utc>> {
+    /// Parse various date formats commonly found in WHOIS data
+    fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
         let date_str = date_str.trim();
         
-        // Common whois date formats to try
-        let formats = [
-            "%Y-%m-%dT%H:%M:%S%.fZ",           // 2025-05-18T13:36:06.0Z
+        // DateTime formats (with time component)
+        const DATETIME_FORMATS: &[&str] = &[
+            "%Y-%m-%dT%H:%M:%S%.fZ",           // 2025-05-18T13:36:06.0Z (ISO 8601)
             "%Y-%m-%dT%H:%M:%S%z",             // 2025-05-18T13:36:06+0000
             "%Y-%m-%d %H:%M:%S",               // 2025-05-18 13:36:06
-            "%Y-%m-%d",                        // 2025-05-18
+        ];
+        
+        // Date-only formats (no time component)
+        const DATE_FORMATS: &[&str] = &[
+            "%Y-%m-%d",                        // 2025-05-18 (ISO 8601)
             "%d-%b-%Y",                        // 18-May-2025
             "%d %b %Y",                        // 18 May 2025
             "%Y/%m/%d",                        // 2025/05/18
@@ -200,31 +209,22 @@ impl WhoisParser {
             "%d.%m.%Y",                        // 18.05.2025
         ];
 
-        // Try parsing with timezone first
-        for format in &formats {
+        // Try parsing with timezone (ISO 8601 with Z or offset)
+        for format in DATETIME_FORMATS {
             if let Ok(dt) = DateTime::parse_from_str(date_str, format) {
                 return Some(dt.with_timezone(&Utc));
             }
         }
 
         // Try parsing as naive datetime and assume UTC
-        for format in &formats {
+        for format in DATETIME_FORMATS {
             if let Ok(naive_dt) = NaiveDateTime::parse_from_str(date_str, format) {
                 return Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
             }
         }
 
-        // Try parsing just the date part and assume midnight UTC
-        let date_only_formats = [
-            "%Y-%m-%d",
-            "%d-%b-%Y", 
-            "%d %b %Y",
-            "%Y/%m/%d",
-            "%m/%d/%Y",
-            "%d.%m.%Y",
-        ];
-
-        for format in &date_only_formats {
+        // Try parsing as date-only and assume midnight UTC
+        for format in DATE_FORMATS {
             if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_str, format) {
                 if let Some(naive_dt) = naive_date.and_hms_opt(0, 0, 0) {
                     return Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
@@ -234,5 +234,11 @@ impl WhoisParser {
 
         debug!("Failed to parse date: {}", date_str);
         None
+    }
+}
+
+impl Default for WhoisParser {
+    fn default() -> Self {
+        Self::new()
     }
 } 

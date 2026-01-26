@@ -1,32 +1,21 @@
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 
-#[derive(Debug, Clone)]
+/// Application configuration loaded from environment variables with intelligent defaults.
+/// 
+/// All fields are serializable for debugging/logging purposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
     pub whois_timeout_seconds: u64,
     pub max_response_size: usize,
     pub cache_ttl_seconds: u64,
     pub cache_max_entries: u64,
-    pub start_time: Instant,
     pub max_referrals: usize,
     pub discovery_timeout_seconds: u64,
     pub concurrent_whois_queries: usize,
-    pub buffer_pool_size: usize,    // Max buffers in pool
-    pub buffer_size: usize,         // Size of each buffer
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ConfigData {
-    pub port: u16,
-    pub whois_timeout_seconds: u64,
-    pub max_response_size: usize,
-    pub cache_ttl_seconds: u64,
-    pub cache_max_entries: u64,
-    pub max_referrals: usize,
-    pub discovery_timeout_seconds: u64,
-    pub concurrent_whois_queries: usize,
+    /// Maximum number of buffers in the pool
     pub buffer_pool_size: usize,
+    /// Size of each buffer in bytes
     pub buffer_size: usize,
 }
 
@@ -50,21 +39,35 @@ impl Config {
         // Override with environment variables if present
         settings = Self::apply_env_overrides(settings)?;
 
-        let config_data: ConfigData = settings.build()?.try_deserialize()?;
+        let config: Config = settings.build()?.try_deserialize()?;
         
-        Ok(Config {
-            port: config_data.port,
-            whois_timeout_seconds: config_data.whois_timeout_seconds,
-            max_response_size: config_data.max_response_size,
-            cache_ttl_seconds: config_data.cache_ttl_seconds,
-            cache_max_entries: config_data.cache_max_entries,
-            max_referrals: config_data.max_referrals,
-            discovery_timeout_seconds: config_data.discovery_timeout_seconds,
-            concurrent_whois_queries: config_data.concurrent_whois_queries,
-            buffer_pool_size: config_data.buffer_pool_size,
-            buffer_size: config_data.buffer_size,
-            start_time: Instant::now(),
-        })
+        // Validate configuration values
+        config.validate()?;
+        
+        Ok(config)
+    }
+
+    /// Validate configuration values to catch invalid settings early
+    fn validate(&self) -> Result<(), config::ConfigError> {
+        if self.port == 0 {
+            return Err(config::ConfigError::Message("port cannot be 0".into()));
+        }
+        if self.whois_timeout_seconds == 0 {
+            return Err(config::ConfigError::Message("whois_timeout_seconds cannot be 0".into()));
+        }
+        if self.buffer_size == 0 {
+            return Err(config::ConfigError::Message("buffer_size cannot be 0".into()));
+        }
+        if self.buffer_pool_size == 0 {
+            return Err(config::ConfigError::Message("buffer_pool_size cannot be 0".into()));
+        }
+        if self.max_response_size == 0 {
+            return Err(config::ConfigError::Message("max_response_size cannot be 0".into()));
+        }
+        if self.concurrent_whois_queries == 0 {
+            return Err(config::ConfigError::Message("concurrent_whois_queries cannot be 0".into()));
+        }
+        Ok(())
     }
 
     fn detect_system_capabilities() -> SystemCapabilities {
