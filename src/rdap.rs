@@ -7,10 +7,11 @@ use crate::{
     config::Config,
     errors::WhoisError,
     ParsedWhoisData,
+    tld::extract_tld,
+    dates,
 };
 use once_cell::sync::Lazy;  // Used by include!(rdap_mappings.rs)
-use psl::Psl;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -44,15 +45,17 @@ pub struct RdapResult {
     pub parsing_analysis: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapBootstrap {
     services: Vec<RdapBootstrapEntry>,
     #[serde(rename = "publicationDate")]
+    #[allow(dead_code)]
     publication_date: Option<String>,
+    #[allow(dead_code)]
     version: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapBootstrapEntry {
     #[serde(rename = "0")]
     tlds: Vec<String>,
@@ -60,13 +63,8 @@ struct RdapBootstrapEntry {
     servers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapDomainResponse {
-    #[serde(rename = "objectClassName")]
-    object_class_name: Option<String>,
-    handle: Option<String>,
-    #[serde(rename = "ldhName")]
-    ldh_name: Option<String>,
     #[serde(rename = "nameservers")]
     name_servers: Option<Vec<RdapNameserver>>,
     events: Option<Vec<RdapEvent>>,
@@ -74,17 +72,13 @@ struct RdapDomainResponse {
     status: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapNameserver {
-    #[serde(rename = "objectClassName")]
-    object_class_name: Option<String>,
     #[serde(rename = "ldhName")]
     ldh_name: Option<String>,
-    #[serde(rename = "unicodeName")]
-    unicode_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapEvent {
     #[serde(rename = "eventAction")]
     event_action: Option<String>,
@@ -92,11 +86,8 @@ struct RdapEvent {
     event_date: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct RdapEntity {
-    #[serde(rename = "objectClassName")]
-    object_class_name: Option<String>,
-    handle: Option<String>,
     roles: Option<Vec<String>>,
     #[serde(rename = "vcardArray")]
     vcard_array: Option<serde_json::Value>,
@@ -137,8 +128,8 @@ impl RdapService {
             return Err(WhoisError::InvalidDomain(domain));
         }
         
-        // Extract TLD from the domain using embedded PSL
-        let tld = Self::extract_tld(&domain)?;
+        // Extract TLD from the domain using shared PSL-based extraction
+        let tld = extract_tld(&domain)?;
         
         // Find appropriate RDAP server (hybrid: hardcoded + bootstrap discovery)
         let rdap_server = self.find_rdap_server(&tld).await?;
@@ -155,33 +146,6 @@ impl RdapService {
             parsed_data,
             parsing_analysis,
         })
-    }
-
-    /// Extract TLD from domain using the embedded Public Suffix List
-    /// The `psl` crate contains an up-to-date embedded PSL, updated with each crate release
-    fn extract_tld(domain: &str) -> Result<String, WhoisError> {
-        // Use the psl crate's embedded public suffix list
-        match psl::List.suffix(domain.as_bytes()) {
-            Some(suffix) => {
-                match std::str::from_utf8(suffix.as_bytes()) {
-                    Ok(tld) => {
-                        debug!("PSL extracted TLD '{}' from domain '{}'", tld, domain);
-                        Ok(tld.to_string())
-                    },
-                    Err(_) => Err(WhoisError::InvalidDomain(format!("Invalid UTF-8 in TLD for domain: {}", domain)))
-                }
-            },
-            None => {
-                // Fallback to simple extraction for edge cases
-                debug!("PSL suffix not found for {}, using simple extraction", domain);
-                let parts: Vec<&str> = domain.split('.').collect();
-                if parts.is_empty() {
-                    Err(WhoisError::InvalidDomain(format!("No TLD found in domain: {}", domain)))
-                } else {
-                    Ok(parts[parts.len() - 1].to_string())
-                }
-            }
-        }
     }
 
     async fn find_rdap_server(&self, tld: &str) -> Result<String, WhoisError> {
@@ -401,8 +365,15 @@ impl RdapService {
                     }
                 }
 
-                // Calculate date-based fields using the same logic as WHOIS parser
-                Self::calculate_date_fields(&mut parsed);
+                // Calculate date-based fields using shared date utilities
+                let (created_ago, updated_ago, expires_in) = dates::calculate_date_fields(
+                    &parsed.creation_date,
+                    &parsed.updated_date,
+                    &parsed.expiration_date,
+                );
+                parsed.created_ago = created_ago;
+                parsed.updated_ago = updated_ago;
+                parsed.expires_in = expires_in;
 
                 analysis.push(format!("✓ RDAP JSON parsed successfully"));
                 analysis.push(format!("✓ Registrar: {}", parsed.registrar.as_ref().unwrap_or(&"NOT FOUND".to_string())));
@@ -420,41 +391,6 @@ impl RdapService {
                 (None, analysis)
             }
         }
-    }
-
-    fn calculate_date_fields(parsed: &mut ParsedWhoisData) {
-        let now = chrono::Utc::now();
-        
-        // Calculate created_ago (days since creation)
-        if let Some(ref creation_date) = parsed.creation_date {
-            if let Some(created_dt) = Self::parse_iso_date(creation_date) {
-                let days_ago = (now - created_dt).num_days();
-                parsed.created_ago = Some(days_ago);
-            }
-        }
-        
-        // Calculate updated_ago (days since last update)
-        if let Some(ref updated_date) = parsed.updated_date {
-            if let Some(updated_dt) = Self::parse_iso_date(updated_date) {
-                let days_ago = (now - updated_dt).num_days();
-                parsed.updated_ago = Some(days_ago);
-            }
-        }
-        
-        // Calculate expires_in (days until expiration, negative if expired)
-        if let Some(ref expiration_date) = parsed.expiration_date {
-            if let Some(expires_dt) = Self::parse_iso_date(expiration_date) {
-                let days_until = (expires_dt - now).num_days();
-                parsed.expires_in = Some(days_until);
-            }
-        }
-    }
-
-    fn parse_iso_date(date_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        // RDAP dates are typically ISO 8601 format
-        chrono::DateTime::parse_from_rfc3339(date_str)
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-            .ok()
     }
 
     fn extract_registrar_from_vcard(_vcard: &serde_json::Value) -> Option<String> {

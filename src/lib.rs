@@ -36,6 +36,8 @@ pub mod errors;
 pub mod tld_mappings;
 pub mod buffer_pool;
 pub mod parser;
+pub mod tld;
+pub mod dates;
 
 
 // Re-export main types for easy access
@@ -44,10 +46,109 @@ pub use rdap::{RdapService, RdapResult};
 pub use cache::CacheService;
 pub use config::Config;
 pub use errors::WhoisError;
+pub use tld::extract_tld;
+pub use dates::{parse_date, calculate_date_fields};
 
 
 
 use std::sync::Arc;
+
+/// Validated and normalized domain name.
+/// 
+/// Ensures domain conforms to RFC 1035 / RFC 5891 requirements:
+/// - Total length <= 253 characters
+/// - Contains at least one dot (TLD required)
+/// - No consecutive dots or leading/trailing dots
+/// - Each label is 1-63 characters
+/// - Labels don't start or end with hyphens
+/// - Only alphanumeric characters and hyphens allowed
+#[derive(Debug, Clone)]
+pub struct ValidatedDomain(pub String);
+
+impl ValidatedDomain {
+    /// Validate and normalize a domain name per RFC 1035 / RFC 5891
+    pub fn new(domain: impl Into<String>) -> Result<Self, WhoisError> {
+        let domain = domain.into().trim().to_lowercase();
+        
+        // Check for empty domain
+        if domain.is_empty() {
+            return Err(WhoisError::InvalidDomain("Empty domain".to_string()));
+        }
+        
+        // RFC 1035: Total domain length max 253 characters
+        if domain.len() > 253 {
+            return Err(WhoisError::InvalidDomain("Domain name too long".to_string()));
+        }
+        
+        // Must have at least one dot (TLD required)
+        if !domain.contains('.') {
+            return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
+        }
+        
+        // Check for invalid dot patterns
+        if domain.contains("..") || domain.starts_with('.') || domain.ends_with('.') {
+            return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
+        }
+        
+        // Validate each label
+        for label in domain.split('.') {
+            Self::validate_label(label)?;
+        }
+        
+        Ok(ValidatedDomain(domain))
+    }
+    
+    /// Validate a single domain label per RFC 1035
+    fn validate_label(label: &str) -> Result<(), WhoisError> {
+        // RFC 1035: Labels must be 1-63 characters
+        if label.is_empty() || label.len() > 63 {
+            return Err(WhoisError::InvalidDomain(
+                format!("Label '{}' has invalid length (must be 1-63 chars)", label)
+            ));
+        }
+        
+        // RFC 1035: Labels cannot start or end with hyphen
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(WhoisError::InvalidDomain(
+                format!("Label '{}' cannot start or end with hyphen", label)
+            ));
+        }
+        
+        // RFC 1035: Labels can only contain alphanumeric and hyphens
+        // Exception: Allow punycode (xn--) for internationalized domain names
+        for ch in label.chars() {
+            if !ch.is_ascii_alphanumeric() && ch != '-' {
+                return Err(WhoisError::InvalidDomain(
+                    format!("Invalid character '{}' in domain", ch)
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the validated domain string
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    
+    /// Consume and return the inner string
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for ValidatedDomain {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ValidatedDomain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Parsed whois data structure with calculated fields
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -156,21 +257,24 @@ impl WhoisClient {
     /// Perform a whois lookup with caching options
     pub async fn lookup_with_options(&self, domain: &str, fresh: bool) -> Result<WhoisResponse, WhoisError> {
         let start_time = std::time::Instant::now();
-        let normalized_domain = Self::validate_and_normalize_domain(domain)?;
+        
+        // Use shared ValidatedDomain for consistent validation
+        let validated = ValidatedDomain::new(domain)?;
+        let domain_str = validated.as_str();
 
         // Check cache first (if available and not requesting fresh)
         if !fresh {
-            if let Some(cached_result) = self.check_cache(&normalized_domain).await {
+            if let Some(cached_result) = self.check_cache(domain_str).await {
                 return Ok(cached_result);
             }
         }
 
         // Perform fresh lookup
-        let result = self.service.lookup(&normalized_domain).await?;
+        let result = self.service.lookup(domain_str).await?;
         let query_time = start_time.elapsed().as_millis() as u64;
         
         let response = WhoisResponse {
-            domain: normalized_domain.clone(),
+            domain: validated.into_inner(),
             whois_server: result.server,
             raw_data: result.raw_data,
             parsed_data: result.parsed_data,
@@ -180,25 +284,9 @@ impl WhoisClient {
         };
 
         // Cache the result if cache is available
-        self.cache_result(&normalized_domain, &response).await;
+        self.cache_result(&response.domain, &response).await;
 
         Ok(response)
-    }
-
-    /// Validate and normalize domain - eliminates DRY violation
-    fn validate_and_normalize_domain(domain: &str) -> Result<String, WhoisError> {
-        let normalized_domain = domain.trim().to_lowercase();
-        
-        // Basic domain validation
-        if normalized_domain.is_empty() {
-            return Err(WhoisError::InvalidDomain("Empty domain".to_string()));
-        }
-        
-        if !normalized_domain.contains('.') {
-            return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
-        }
-
-        Ok(normalized_domain)
     }
 
     /// Check cache for a cached response

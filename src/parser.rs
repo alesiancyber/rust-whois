@@ -1,18 +1,12 @@
-use crate::ParsedWhoisData;
-use chrono::{DateTime, Utc, NaiveDateTime};
-use tracing::debug;
+use crate::{ParsedWhoisData, dates};
 
 /// Stateless WHOIS response parser
 /// 
 /// All methods are associated functions since parsing is pure computation.
+/// No instance is needed - use `WhoisParser::parse_whois_data(data)` directly.
 pub struct WhoisParser;
 
 impl WhoisParser {
-    #[must_use]
-    pub fn new() -> Self {
-        Self
-    }
-
     /// Parse raw WHOIS data into structured fields
     pub fn parse_whois_data(data: &str) -> ParsedWhoisData {
         let mut parsed = ParsedWhoisData {
@@ -120,36 +114,17 @@ impl WhoisParser {
             }
         }
 
-        // Calculate date-based fields
-        Self::calculate_date_fields(&mut parsed);
+        // Calculate date-based fields using shared date utilities
+        let (created_ago, updated_ago, expires_in) = dates::calculate_date_fields(
+            &parsed.creation_date,
+            &parsed.updated_date,
+            &parsed.expiration_date,
+        );
+        parsed.created_ago = created_ago;
+        parsed.updated_ago = updated_ago;
+        parsed.expires_in = expires_in;
 
         parsed
-    }
-
-    /// Calculate relative date fields (days ago, days until expiry)
-    fn calculate_date_fields(parsed: &mut ParsedWhoisData) {
-        let now = Utc::now();
-        
-        // Calculate created_ago (days since creation)
-        if let Some(ref creation_date) = parsed.creation_date {
-            if let Some(created_dt) = Self::parse_date(creation_date) {
-                parsed.created_ago = Some((now - created_dt).num_days());
-            }
-        }
-        
-        // Calculate updated_ago (days since last update)
-        if let Some(ref updated_date) = parsed.updated_date {
-            if let Some(updated_dt) = Self::parse_date(updated_date) {
-                parsed.updated_ago = Some((now - updated_dt).num_days());
-            }
-        }
-        
-        // Calculate expires_in (days until expiration, negative if expired)
-        if let Some(ref expiration_date) = parsed.expiration_date {
-            if let Some(expires_dt) = Self::parse_date(expiration_date) {
-                parsed.expires_in = Some((expires_dt - now).num_days());
-            }
-        }
     }
 
     /// Parse WHOIS data and return detailed analysis for debugging
@@ -186,59 +161,5 @@ impl WhoisParser {
         }
         
         (parsed, analysis)
-    }
-
-    /// Parse various date formats commonly found in WHOIS data
-    fn parse_date(date_str: &str) -> Option<DateTime<Utc>> {
-        let date_str = date_str.trim();
-        
-        // DateTime formats (with time component)
-        const DATETIME_FORMATS: &[&str] = &[
-            "%Y-%m-%dT%H:%M:%S%.fZ",           // 2025-05-18T13:36:06.0Z (ISO 8601)
-            "%Y-%m-%dT%H:%M:%S%z",             // 2025-05-18T13:36:06+0000
-            "%Y-%m-%d %H:%M:%S",               // 2025-05-18 13:36:06
-        ];
-        
-        // Date-only formats (no time component)
-        const DATE_FORMATS: &[&str] = &[
-            "%Y-%m-%d",                        // 2025-05-18 (ISO 8601)
-            "%d-%b-%Y",                        // 18-May-2025
-            "%d %b %Y",                        // 18 May 2025
-            "%Y/%m/%d",                        // 2025/05/18
-            "%m/%d/%Y",                        // 05/18/2025
-            "%d.%m.%Y",                        // 18.05.2025
-        ];
-
-        // Try parsing with timezone (ISO 8601 with Z or offset)
-        for format in DATETIME_FORMATS {
-            if let Ok(dt) = DateTime::parse_from_str(date_str, format) {
-                return Some(dt.with_timezone(&Utc));
-            }
-        }
-
-        // Try parsing as naive datetime and assume UTC
-        for format in DATETIME_FORMATS {
-            if let Ok(naive_dt) = NaiveDateTime::parse_from_str(date_str, format) {
-                return Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
-            }
-        }
-
-        // Try parsing as date-only and assume midnight UTC
-        for format in DATE_FORMATS {
-            if let Ok(naive_date) = chrono::NaiveDate::parse_from_str(date_str, format) {
-                if let Some(naive_dt) = naive_date.and_hms_opt(0, 0, 0) {
-                    return Some(DateTime::from_naive_utc_and_offset(naive_dt, Utc));
-                }
-            }
-        }
-
-        debug!("Failed to parse date: {}", date_str);
-        None
-    }
-}
-
-impl Default for WhoisParser {
-    fn default() -> Self {
-        Self::new()
     }
 } 

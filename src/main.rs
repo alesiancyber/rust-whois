@@ -34,6 +34,7 @@ use whois_service::{
     config::Config,
     errors::WhoisError,
     WhoisResponse,
+    ValidatedDomain,
 };
 #[cfg(feature = "openapi")]
 use whois_service::ParsedWhoisData;
@@ -96,82 +97,14 @@ struct LookupResult {
     parsing_analysis: Vec<String>,
 }
 
-// Domain validation helper
-#[derive(Debug, Clone)]
-pub struct ValidatedDomain(pub String);
-
-impl ValidatedDomain {
-    /// Validate and normalize a domain name per RFC 1035 / RFC 5891
-    pub fn validate(domain: String) -> Result<Self, WhoisError> {
-        let domain = domain.trim().to_lowercase();
-        
-        // Check for empty domain
-        if domain.is_empty() {
+/// Validate domain from query parameters (wrapper for metrics integration)
+fn validate_domain_with_metrics(domain: &str) -> Result<ValidatedDomain, WhoisError> {
+    match ValidatedDomain::new(domain) {
+        Ok(validated) => Ok(validated),
+        Err(e) => {
             metrics::increment_errors("invalid_domain");
-            return Err(WhoisError::InvalidDomain("Empty domain".to_string()));
+            Err(e)
         }
-        
-        // RFC 1035: Total domain length max 253 characters
-        if domain.len() > 253 {
-            metrics::increment_errors("domain_too_long");
-            return Err(WhoisError::InvalidDomain("Domain name too long".to_string()));
-        }
-        
-        // Must have at least one dot (TLD required)
-        if !domain.contains('.') {
-            metrics::increment_errors("invalid_domain_format");
-            return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
-        }
-        
-        // Check for invalid dot patterns
-        if domain.contains("..") || domain.starts_with('.') || domain.ends_with('.') {
-            metrics::increment_errors("invalid_domain_format");
-            return Err(WhoisError::InvalidDomain("Invalid domain format".to_string()));
-        }
-        
-        // Validate each label
-        for label in domain.split('.') {
-            Self::validate_label(label)?;
-        }
-        
-        Ok(ValidatedDomain(domain))
-    }
-    
-    /// Validate a single domain label per RFC 1035
-    fn validate_label(label: &str) -> Result<(), WhoisError> {
-        // RFC 1035: Labels must be 1-63 characters
-        if label.is_empty() || label.len() > 63 {
-            metrics::increment_errors("invalid_label_length");
-            return Err(WhoisError::InvalidDomain(
-                format!("Label '{}' has invalid length (must be 1-63 chars)", label)
-            ));
-        }
-        
-        // RFC 1035: Labels cannot start or end with hyphen
-        if label.starts_with('-') || label.ends_with('-') {
-            metrics::increment_errors("invalid_label_format");
-            return Err(WhoisError::InvalidDomain(
-                format!("Label '{}' cannot start or end with hyphen", label)
-            ));
-        }
-        
-        // RFC 1035: Labels can only contain alphanumeric and hyphens
-        // Exception: Allow punycode (xn--) for internationalized domain names
-        for ch in label.chars() {
-            if !ch.is_ascii_alphanumeric() && ch != '-' {
-                metrics::increment_errors("invalid_domain_chars");
-                return Err(WhoisError::InvalidDomain(
-                    format!("Invalid character '{}' in domain", ch)
-                ));
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Validate domain from query parameters
-    pub(crate) fn from_query(params: &WhoisQuery) -> Result<Self, WhoisError> {
-        Self::validate(params.domain.clone())
     }
 }
 
@@ -385,8 +318,8 @@ async fn whois_lookup(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = ValidatedDomain::from_query(&params)?;
-    perform_whois_lookup(&state, validated.0, params.fresh, false).await
+    let validated = validate_domain_with_metrics(&params.domain)?;
+    perform_whois_lookup(&state, validated.into_inner(), params.fresh, false).await
 }
 
 // Helper function to handle cache writes with timeout
@@ -445,9 +378,9 @@ async fn whois_debug(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = ValidatedDomain::from_query(&params)?;
+    let validated = validate_domain_with_metrics(&params.domain)?;
     // Debug always uses fresh lookup (ignore params.fresh, always true)
-    perform_whois_lookup(&state, validated.0, true, true).await
+    perform_whois_lookup(&state, validated.into_inner(), true, true).await
 }
 
 // Path-based whois lookup for easier testing
@@ -470,8 +403,8 @@ async fn whois_lookup_path(
     Query(params): Query<PathQueryParams>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = ValidatedDomain::validate(domain)?;
-    perform_whois_lookup(&state, validated.0, params.fresh, false).await
+    let validated = validate_domain_with_metrics(&domain)?;
+    perform_whois_lookup(&state, validated.into_inner(), params.fresh, false).await
 }
 
 // Path-based debug lookup for easier testing
@@ -493,9 +426,9 @@ async fn whois_debug_path(
     Path(domain): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = ValidatedDomain::validate(domain)?;
+    let validated = validate_domain_with_metrics(&domain)?;
     // Debug always uses fresh lookup (cache bypass)
-    perform_whois_lookup(&state, validated.0, true, true).await
+    perform_whois_lookup(&state, validated.into_inner(), true, true).await
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(

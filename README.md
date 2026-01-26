@@ -6,9 +6,12 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 
 - **RDAP-first** with automatic WHOIS fallback for universal coverage
 - **1,194 TLD mappings** auto-generated from IANA bootstrap data at build time
+- **Domain and IP address lookups** (IPv4 and IPv6)
 - **Intelligent caching** with configurable TTL (avoids rate limiting)
 - **Calculated fields** for threat detection: `created_ago`, `updated_ago`, `expires_in`
 - **Dual-use**: Import as a Rust library or run as an HTTP API
+
+> **Note**: This is the `dev-ip-lookup` branch with full IP address support. See `main` branch for stable domain-only lookups.
 
 ## Quick Start
 
@@ -17,12 +20,16 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 ```bash
 git clone https://github.com/alesiancyber/rust-whois.git
 cd rust-whois
+git checkout dev-ip-lookup
 cargo run --release
 ```
 
 ```bash
 # Domain lookup
 curl "http://localhost:3000/whois/google.com"
+
+# IP address lookup
+curl "http://localhost:3000/ip/8.8.8.8"
 
 # Health check
 curl "http://localhost:3000/health"
@@ -37,12 +44,20 @@ whois-service = "0.1"
 
 ```rust
 use whois_service::WhoisClient;
+use std::net::IpAddr;
 
 #[tokio::main]
 async fn main() {
     let client = WhoisClient::new().await;
-    let result = client.lookup("example.com").await.unwrap();
-    println!("Created {} days ago", result.parsed_data.created_ago.unwrap_or(0));
+    
+    // Domain lookup
+    let domain = client.lookup("example.com").await.unwrap();
+    println!("Created {} days ago", domain.parsed_data.created_ago.unwrap_or(0));
+    
+    // IP lookup
+    let ip: IpAddr = "8.8.8.8".parse().unwrap();
+    let ip_info = client.lookup_ip(ip).await.unwrap();
+    println!("Organization: {}", ip_info.parsed_data.organization.unwrap_or_default());
 }
 ```
 
@@ -50,16 +65,32 @@ async fn main() {
 
 ## API Endpoints
 
+### Domain Lookups
+
 | Endpoint | Description |
 |----------|-------------|
 | `GET /whois?domain=example.com` | Query via parameter |
 | `GET /whois/:domain` | Query via path |
 | `GET /whois/debug/:domain` | Include parsing analysis |
+
+### IP Address Lookups
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /ip?ip=8.8.8.8` | Query via parameter |
+| `GET /ip/:ip` | Query via path (IPv4 or IPv6) |
+
+### System
+
+| Endpoint | Description |
+|----------|-------------|
 | `GET /health` | Service health check |
 | `GET /metrics` | Prometheus metrics |
 | `GET /docs` | OpenAPI/Swagger UI (with `openapi` feature) |
 
-## Response Format
+## Response Formats
+
+### Domain Response
 
 ```json
 {
@@ -70,7 +101,6 @@ async fn main() {
     "creation_date": "1997-09-15T04:00:00Z",
     "expiration_date": "2028-09-14T04:00:00Z",
     "name_servers": ["NS1.EXAMPLE.COM", "NS2.EXAMPLE.COM"],
-    "status": ["clientTransferProhibited"],
     "created_ago": 10360,
     "expires_in": 961
   },
@@ -79,14 +109,35 @@ async fn main() {
 }
 ```
 
+### IP Response
+
+```json
+{
+  "ip": "8.8.8.8",
+  "server": "RDAP: https://rdap.arin.net/registry/",
+  "parsed_data": {
+    "range": "8.8.8.0 - 8.8.8.255",
+    "net_name": "GOGL",
+    "organization": "Google LLC",
+    "net_handle": "NET-8-8-8-0-2",
+    "start_address": "8.8.8.0",
+    "end_address": "8.8.8.255",
+    "registration_date": "2023-12-28T17:24:33-05:00"
+  },
+  "cached": false,
+  "query_time_ms": 350
+}
+```
+
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Fresh lookup | 450-900ms |
+| Fresh domain lookup | 450-900ms |
+| Fresh IP lookup | 250-500ms |
 | Cached lookup | <5ms |
-| Throughput | 800+ domains/min |
-| Cache capacity | 10K+ domains |
+| Throughput | 800+ lookups/min |
+| Cache capacity | 10K+ entries |
 
 ## Configuration
 
@@ -108,21 +159,7 @@ The service auto-adapts to available system resources (memory, CPU cores).
 | Branch | Description |
 |--------|-------------|
 | `main` | Stable release - domain lookups only |
-| `dev-ip-lookup` | **Experimental** - adds IPv4/IPv6 address lookups |
-
-### IP Address Support (dev-ip-lookup branch)
-
-The `dev-ip-lookup` branch adds IP address ownership lookups:
-
-```bash
-# IPv4
-curl "http://localhost:3000/ip/8.8.8.8"
-
-# IPv6  
-curl "http://localhost:3000/ip/2001:4860:4860::8888"
-```
-
-Returns organization, network range, RIR, and registration details via RDAP (with WHOIS fallback).
+| `dev-ip-lookup` | **This branch** - adds IPv4/IPv6 address lookups |
 
 ## Build
 
@@ -139,4 +176,4 @@ cargo build --no-default-features
 
 ## License
 
-MIT 
+MIT

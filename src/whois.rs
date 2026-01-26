@@ -4,9 +4,9 @@ use crate::{
     ParsedWhoisData,
     tld_mappings::HARDCODED_TLD_SERVERS,
     buffer_pool::{BufferPool, PooledBuffer},
-    parser::WhoisParser,  // Used for associated function calls
+    parser::WhoisParser,
+    tld::extract_tld,
 };
-use psl::Psl;
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -71,8 +71,8 @@ impl WhoisService {
     pub async fn lookup(&self, domain: &str) -> Result<WhoisResult, WhoisError> {
         let domain = domain.trim().to_lowercase();
         
-        // Extract TLD from the domain using embedded PSL
-        let tld = Self::extract_tld(&domain)?;
+        // Extract TLD from the domain using shared PSL-based extraction
+        let tld = extract_tld(&domain)?;
         
         // Find appropriate whois server (hybrid: hardcoded + dynamic discovery)
         let whois_server = self.find_whois_server(&tld).await?;
@@ -92,35 +92,6 @@ impl WhoisService {
             parsed_data: Some(parsed_data),
             parsing_analysis,
         })
-    }
-
-    /// Extract TLD from domain using the embedded Public Suffix List
-    /// The `psl` crate contains an up-to-date embedded PSL, updated with each crate release
-    fn extract_tld(domain: &str) -> Result<String, WhoisError> {
-        // Use the psl crate's embedded public suffix list
-        match psl::List.suffix(domain.as_bytes()) {
-            Some(suffix) => {
-                match std::str::from_utf8(suffix.as_bytes()) {
-                    Ok(tld) => {
-                        debug!("PSL extracted TLD '{}' from domain '{}'", tld, domain);
-                        Ok(tld.to_string())
-                    },
-                    Err(_) => Err(WhoisError::InvalidDomain(format!("Invalid UTF-8 in TLD for domain: {}", domain)))
-                }
-            },
-            None => {
-                // Fallback for edge cases (should be rare with proper PSL)
-                // This handles malformed domains or very new TLDs not yet in PSL
-                warn!("PSL suffix not found for '{}', falling back to simple extraction", domain);
-                let parts: Vec<&str> = domain.split('.').collect();
-                if parts.len() < 2 {
-                    Err(WhoisError::InvalidDomain(format!("No TLD found in domain: {}", domain)))
-                } else {
-                    // Return just the last segment as TLD
-                    Ok(parts[parts.len() - 1].to_string())
-                }
-            }
-        }
     }
 
     async fn find_whois_server(&self, tld: &str) -> Result<String, WhoisError> {

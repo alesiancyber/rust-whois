@@ -93,11 +93,9 @@ pub async fn metrics_handler() -> impl IntoResponse {
     }
 }
 
+/// Simple TLD extraction for metrics labeling
+/// Uses the shared tld module's simple extraction (no PSL needed for metrics)
 #[cfg(feature = "server")]
 fn extract_tld(domain: &str) -> String {
-    domain
-        .split('.')
-        .last()
-        .unwrap_or("unknown")
-        .to_lowercase()
+    whois_service::tld::extract_tld_simple(domain)
 } 
