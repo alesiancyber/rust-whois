@@ -316,6 +316,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+## 🌐 IP Address Lookups
+
+The library also supports IP address lookups (IPv4 and IPv6) with automatic RIR detection.
+
+### Basic IP Lookup
+
+```rust
+use whois_service::{WhoisService, RdapService, Config};
+use std::sync::Arc;
+use std::net::IpAddr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(Config::load()?);
+    let whois = WhoisService::new(config.clone()).await?;
+    let rdap = RdapService::new(config).await?;
+    
+    let ip: IpAddr = "8.8.8.8".parse()?;
+    
+    // Try RDAP first (modern, structured)
+    match rdap.lookup_ip(ip).await {
+        Ok(result) => {
+            println!("Organization: {:?}", result.parsed_data.organization);
+            println!("Network: {:?}", result.parsed_data.range);
+            println!("Country: {:?}", result.parsed_data.country);
+            println!("Abuse Email: {:?}", result.parsed_data.abuse_email);
+        }
+        Err(_) => {
+            // Fallback to WHOIS
+            let result = whois.lookup_ip(ip).await?;
+            println!("RIR: {:?}", result.parsed_data.rir);
+            println!("Organization: {:?}", result.parsed_data.organization);
+        }
+    }
+    
+    Ok(())
+}
+```
+
+### ParsedIpData Fields
+
+```rust
+pub struct ParsedIpData {
+    pub range: Option<String>,           // IP range (e.g., "8.8.8.0 - 8.8.8.255")
+    pub net_name: Option<String>,        // Network name
+    pub net_handle: Option<String>,      // Network handle/ID
+    pub organization: Option<String>,    // Organization name
+    pub country: Option<String>,         // Country code
+    pub rir: Option<String>,             // Regional Internet Registry
+    pub registration_date: Option<String>,
+    pub updated_date: Option<String>,
+    pub abuse_email: Option<String>,     // Abuse contact
+    pub description: Option<String>,
+    pub cidr: Option<String>,            // CIDR notation
+    pub start_address: Option<String>,
+    pub end_address: Option<String>,
+    pub asn: Option<String>,             // AS Number
+}
+```
+
 ## 🔗 API Reference
 
 ### WhoisClient Methods
@@ -325,6 +385,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - `WhoisClient::new_with_config(config)` - Create client with custom configuration
 - `client.lookup(domain)` - Lookup domain (uses cache if available)
 - `client.lookup_fresh(domain)` - Lookup domain (always queries server)
+
+### WhoisService IP Methods
+
+- `whois_service.lookup_ip(ip)` - Lookup IP address via WHOIS (with RIR detection)
+
+### RdapService IP Methods
+
+- `rdap_service.lookup_ip(ip)` - Lookup IP address via RDAP (uses IANA bootstrap)
 
 ### WhoisResponse Fields
 
@@ -363,6 +431,7 @@ pub struct ParsedWhoisData {
 ```rust
 pub enum WhoisError {
     InvalidDomain(String),    // Domain validation failed
+    InvalidIp(String),        // IP address validation failed
     UnsupportedTld(String),   // TLD not supported
     Timeout,                  // Network timeout
     ResponseTooLarge,         // Response exceeded size limit

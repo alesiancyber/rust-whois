@@ -36,14 +36,16 @@ pub mod errors;
 pub mod tld_mappings;
 pub mod buffer_pool;
 pub mod parser;
+pub mod ip;
 
 
 // Re-export main types for easy access
-pub use whois::{WhoisService, WhoisResult};
-pub use rdap::{RdapService, RdapResult};
+pub use whois::{WhoisService, WhoisResult, IpWhoisResult};
+pub use rdap::{RdapService, RdapResult, IpRdapResult};
 pub use cache::CacheService;
 pub use config::Config;
 pub use errors::WhoisError;
+pub use ip::{LookupTarget, ParsedIpData, IpParser, Rir};
 
 
 
@@ -173,7 +175,7 @@ impl WhoisClient {
             domain: normalized_domain.clone(),
             whois_server: result.server,
             raw_data: result.raw_data,
-            parsed_data: result.parsed_data,
+            parsed_data: Some(result.parsed_data), // WHOIS parser always returns data
             cached: false,
             query_time_ms: query_time,
             parsing_analysis: None, // No debug info in library mode
@@ -246,6 +248,26 @@ pub struct WhoisResponse {
     pub query_time_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parsing_analysis: Option<Vec<String>>,
+}
+
+/// Response for IP address lookups
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct IpResponse {
+    /// IP address that was queried
+    #[cfg_attr(feature = "openapi", schema(example = "8.8.8.8"))]
+    pub ip: String,
+    /// Server that provided the response
+    #[cfg_attr(feature = "openapi", schema(example = "whois.arin.net"))]
+    pub server: String,
+    /// Raw response data
+    pub raw_data: String,
+    /// Parsed IP data
+    pub parsed_data: ip::ParsedIpData,
+    /// Whether the response was from cache
+    pub cached: bool,
+    /// Query time in milliseconds
+    pub query_time_ms: u64,
 }
 
 #[cfg(test)]

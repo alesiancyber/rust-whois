@@ -7,7 +7,9 @@ use crate::{
     config::Config,
     errors::WhoisError,
     ParsedWhoisData,
+    ip::ParsedIpData,
 };
+use std::net::IpAddr;
 use once_cell::sync::Lazy;  // Used by include!(rdap_mappings.rs)
 use psl::Psl;
 use serde::{Deserialize, Serialize};
@@ -20,8 +22,10 @@ use tokio::sync::{OnceCell, Semaphore};
 use tracing::{debug, info, warn};
 use url::Url;
 
-// RDAP Bootstrap Service URL for dynamic discovery
+// RDAP Bootstrap Service URLs for dynamic discovery
 const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
+const RDAP_IPV4_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/ipv4.json";
+const RDAP_IPV6_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/ipv6.json";
 
 // Include the auto-generated RDAP mappings from build script
 include!(concat!(env!("OUT_DIR"), "/rdap_mappings.rs"));
@@ -33,6 +37,10 @@ pub struct RdapService {
     /// Bootstrap cache using tokio::sync::OnceCell for proper async initialization
     /// get_or_try_init prevents concurrent fetches - only one thread fetches, others wait
     bootstrap_cache: OnceCell<RdapBootstrap>,
+    /// IPv4 bootstrap cache (uses IP ranges)
+    ipv4_bootstrap_cache: OnceCell<IpBootstrap>,
+    /// IPv6 bootstrap cache (uses IP ranges)
+    ipv6_bootstrap_cache: OnceCell<IpBootstrap>,
     query_semaphore: Arc<Semaphore>,
     discovery_semaphore: Arc<Semaphore>,
 }
@@ -42,6 +50,13 @@ pub struct RdapResult {
     pub raw_data: String,
     pub parsed_data: Option<ParsedWhoisData>,
     pub parsing_analysis: Vec<String>,
+}
+
+/// Result of an IP RDAP lookup
+pub struct IpRdapResult {
+    pub server: String,
+    pub raw_data: String,
+    pub parsed_data: ParsedIpData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +71,25 @@ struct RdapBootstrap {
 struct RdapBootstrapEntry {
     #[serde(rename = "0")]
     tlds: Vec<String>,
+    #[serde(rename = "1")]
+    servers: Vec<String>,
+}
+
+/// IANA RDAP bootstrap data for IP addresses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IpBootstrap {
+    services: Vec<IpBootstrapEntry>,
+    #[serde(rename = "publicationDate")]
+    publication_date: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IpBootstrapEntry {
+    /// IP ranges (CIDR notation like "8.0.0.0/8")
+    #[serde(rename = "0")]
+    ranges: Vec<String>,
+    /// RDAP server URLs
     #[serde(rename = "1")]
     servers: Vec<String>,
 }
@@ -117,12 +151,15 @@ impl RdapService {
             client,
             tld_servers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             bootstrap_cache: OnceCell::new(),
+            ipv4_bootstrap_cache: OnceCell::new(),
+            ipv6_bootstrap_cache: OnceCell::new(),
             query_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries)),
             discovery_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries * 2)),
         };
 
         info!("RdapService initialized with hybrid discovery (hardcoded + bootstrap)");
         info!("Generated RDAP servers: {} entries", GENERATED_RDAP_SERVERS.len());
+        info!("IP RDAP support enabled (IPv4 and IPv6)");
         
         Ok(service)
     }
@@ -155,6 +192,260 @@ impl RdapService {
             parsed_data,
             parsing_analysis,
         })
+    }
+
+    /// Perform RDAP lookup for an IP address
+    /// Uses IANA bootstrap data to find the appropriate RIR
+    pub async fn lookup_ip(&self, ip: IpAddr) -> Result<IpRdapResult, WhoisError> {
+        let ip_str = ip.to_string();
+        
+        // Find appropriate RDAP server based on IP range
+        let rdap_server = self.find_ip_rdap_server(ip).await?;
+        
+        // Perform RDAP query for IP
+        let raw_data = self.query_ip_rdap_server(&rdap_server, &ip_str).await?;
+        
+        // Parse RDAP JSON response into IP data format
+        let parsed_data = Self::parse_ip_rdap_response(&raw_data);
+        
+        info!("✓ IP RDAP lookup successful for {} via {}", ip_str, rdap_server);
+        
+        Ok(IpRdapResult {
+            server: rdap_server,
+            raw_data,
+            parsed_data,
+        })
+    }
+
+    /// Find RDAP server for an IP address using IANA bootstrap
+    async fn find_ip_rdap_server(&self, ip: IpAddr) -> Result<String, WhoisError> {
+        let bootstrap = match ip {
+            IpAddr::V4(_) => {
+                self.ipv4_bootstrap_cache
+                    .get_or_try_init(|| self.fetch_ip_bootstrap(RDAP_IPV4_BOOTSTRAP_URL))
+                    .await
+            }
+            IpAddr::V6(_) => {
+                self.ipv6_bootstrap_cache
+                    .get_or_try_init(|| self.fetch_ip_bootstrap(RDAP_IPV6_BOOTSTRAP_URL))
+                    .await
+            }
+        };
+        
+        let bootstrap = bootstrap.map_err(|e| {
+            warn!("Failed to fetch IP RDAP bootstrap: {}", e);
+            WhoisError::Internal(format!("Failed to fetch IP bootstrap data: {}", e))
+        })?;
+        
+        // Find matching range
+        let ip_str = ip.to_string();
+        for entry in &bootstrap.services {
+            for range in &entry.ranges {
+                if Self::ip_matches_range(&ip_str, range, ip.is_ipv4()) {
+                    if let Some(server) = entry.servers.first() {
+                        debug!("Found RDAP server for {}: {} (range: {})", ip_str, server, range);
+                        return Ok(server.clone());
+                    }
+                }
+            }
+        }
+        
+        Err(WhoisError::UnsupportedTld(format!("No RDAP server found for IP: {}", ip_str)))
+    }
+    
+    /// Check if an IP matches a CIDR range (simple prefix matching)
+    fn ip_matches_range(ip: &str, range: &str, is_ipv4: bool) -> bool {
+        // Parse CIDR notation (e.g., "8.0.0.0/8")
+        if let Some(slash_pos) = range.find('/') {
+            let network = &range[..slash_pos];
+            let prefix_len: u8 = range[slash_pos + 1..].parse().unwrap_or(0);
+            
+            if is_ipv4 {
+                // Simple IPv4 prefix matching
+                if let (Ok(ip_addr), Ok(net_addr)) = (
+                    ip.parse::<std::net::Ipv4Addr>(),
+                    network.parse::<std::net::Ipv4Addr>()
+                ) {
+                    let ip_bits = u32::from(ip_addr);
+                    let net_bits = u32::from(net_addr);
+                    let mask = if prefix_len >= 32 { u32::MAX } else { !((1u32 << (32 - prefix_len)) - 1) };
+                    return (ip_bits & mask) == (net_bits & mask);
+                }
+            } else {
+                // Simple IPv6 prefix matching
+                if let (Ok(ip_addr), Ok(net_addr)) = (
+                    ip.parse::<std::net::Ipv6Addr>(),
+                    network.parse::<std::net::Ipv6Addr>()
+                ) {
+                    let ip_bits = u128::from(ip_addr);
+                    let net_bits = u128::from(net_addr);
+                    let mask = if prefix_len >= 128 { u128::MAX } else { !((1u128 << (128 - prefix_len)) - 1) };
+                    return (ip_bits & mask) == (net_bits & mask);
+                }
+            }
+        }
+        false
+    }
+    
+    /// Fetch IP bootstrap data from IANA
+    async fn fetch_ip_bootstrap(&self, url: &str) -> Result<IpBootstrap, WhoisError> {
+        debug!("Fetching IP RDAP bootstrap from: {}", url);
+        
+        let response = self.client
+            .get(url)
+            .send()
+            .await
+            .map_err(WhoisError::HttpError)?;
+        
+        let bootstrap: IpBootstrap = response
+            .json()
+            .await
+            .map_err(WhoisError::HttpError)?;
+        
+        info!("Fetched IP bootstrap with {} entries", bootstrap.services.len());
+        Ok(bootstrap)
+    }
+    
+    /// Query RDAP server for IP information
+    async fn query_ip_rdap_server(&self, base_url: &str, ip: &str) -> Result<String, WhoisError> {
+        let _permit = self.query_semaphore.acquire().await
+            .map_err(|_| WhoisError::Internal("Semaphore closed".to_string()))?;
+        
+        // Build RDAP URL for IP query
+        let url = format!("{}ip/{}", base_url.trim_end_matches('/').to_string() + "/", ip);
+        
+        debug!("Querying IP RDAP: {}", url);
+        
+        let response = self.client
+            .get(&url)
+            .header("Accept", "application/rdap+json")
+            .send()
+            .await
+            .map_err(WhoisError::HttpError)?;
+        
+        // Check response size limit
+        if let Some(content_length) = response.content_length() {
+            if content_length > self.config.max_response_size as u64 {
+                return Err(WhoisError::ResponseTooLarge);
+            }
+        }
+        
+        let raw_data = response
+            .text()
+            .await
+            .map_err(WhoisError::HttpError)?;
+        
+        // Double-check actual size
+        if raw_data.len() > self.config.max_response_size {
+            return Err(WhoisError::ResponseTooLarge);
+        }
+        
+        Ok(raw_data)
+    }
+    
+    /// Parse RDAP IP response into structured data
+    fn parse_ip_rdap_response(raw_data: &str) -> ParsedIpData {
+        let mut parsed = ParsedIpData::default();
+        
+        // Try to parse as JSON
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(raw_data) {
+            // Network handle
+            parsed.net_handle = json.get("handle")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            
+            // Network name
+            parsed.net_name = json.get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            
+            // IP range
+            parsed.start_address = json.get("startAddress")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            parsed.end_address = json.get("endAddress")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            
+            // Build range string
+            if let (Some(start), Some(end)) = (&parsed.start_address, &parsed.end_address) {
+                parsed.range = Some(format!("{} - {}", start, end));
+            }
+            
+            // Country
+            parsed.country = json.get("country")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_uppercase());
+            
+            // Events (registration, update dates)
+            if let Some(events) = json.get("events").and_then(|v| v.as_array()) {
+                for event in events {
+                    let action = event.get("eventAction").and_then(|v| v.as_str());
+                    let date = event.get("eventDate").and_then(|v| v.as_str());
+                    
+                    match (action, date) {
+                        (Some("registration"), Some(d)) => {
+                            parsed.registration_date = Some(d.to_string());
+                        }
+                        (Some("last changed"), Some(d)) => {
+                            parsed.updated_date = Some(d.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            
+            // Entities (organization, abuse contact)
+            if let Some(entities) = json.get("entities").and_then(|v| v.as_array()) {
+                for entity in entities {
+                    if let Some(roles) = entity.get("roles").and_then(|v| v.as_array()) {
+                        let role_strs: Vec<&str> = roles.iter()
+                            .filter_map(|r| r.as_str())
+                            .collect();
+                        
+                        // Organization from registrant role
+                        if role_strs.contains(&"registrant") {
+                            if let Some(name) = entity.get("vcardArray")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.get(1))
+                                .and_then(|v| v.as_array())
+                                .and_then(|props| {
+                                    props.iter().find_map(|p| {
+                                        if p.get(0)?.as_str()? == "fn" {
+                                            p.get(3)?.as_str()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }) {
+                                parsed.organization = Some(name.to_string());
+                            }
+                        }
+                        
+                        // Abuse contact
+                        if role_strs.contains(&"abuse") {
+                            if let Some(email) = entity.get("vcardArray")
+                                .and_then(|v| v.as_array())
+                                .and_then(|arr| arr.get(1))
+                                .and_then(|v| v.as_array())
+                                .and_then(|props| {
+                                    props.iter().find_map(|p| {
+                                        if p.get(0)?.as_str()? == "email" {
+                                            p.get(3)?.as_str()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }) {
+                                parsed.abuse_email = Some(email.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        parsed
     }
 
     /// Extract TLD from domain using the embedded Public Suffix List

@@ -32,6 +32,7 @@ A high-performance, production-ready whois lookup service with **modern RDAP sup
 - **📊 Structured Data**: Consistent parsing with calculated threat intelligence fields
 - **🏭 Production Grade**: Zero-downtime builds, comprehensive error handling
 - **📚 OpenAPI Support**: Full API documentation with Swagger UI (optional feature)
+- **🌍 IP Address Support**: Full IPv4/IPv6 lookup with RIR detection (ARIN, RIPE, APNIC, LACNIC, AFRINIC)
 
 ## 📊 Performance Metrics
 
@@ -140,14 +141,28 @@ curl "http://localhost:3000/metrics"
 
 # API Documentation (when OpenAPI feature is enabled)
 curl "http://localhost:3000/docs"
+
+# IP address lookup (IPv4)
+curl "http://localhost:3000/ip/8.8.8.8"
+
+# IP address lookup (IPv6)
+curl "http://localhost:3000/ip/2001:4860:4860::8888"
 ```
 
 3. **Available Endpoints:**
+
+**Domain Lookups:**
 - `GET /whois?domain=example.com` - Standard whois lookup
 - `POST /whois` - JSON body with domain parameter
 - `GET /whois/:domain` - Path-based lookup
 - `GET /whois/debug?domain=example.com` - Debug mode with parsing analysis
 - `GET /whois/debug/:domain` - Path-based debug lookup
+
+**IP Address Lookups:**
+- `GET /ip?ip=8.8.8.8` - IP address lookup (IPv4 or IPv6)
+- `GET /ip/:ip` - Path-based IP lookup
+
+**System:**
 - `GET /health` - Service health check
 - `GET /metrics` - Prometheus metrics
 - `GET /docs` - OpenAPI documentation (when enabled)

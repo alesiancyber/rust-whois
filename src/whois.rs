@@ -4,8 +4,10 @@ use crate::{
     ParsedWhoisData,
     tld_mappings::HARDCODED_TLD_SERVERS,
     buffer_pool::{BufferPool, PooledBuffer},
-    parser::WhoisParser,  // Used for associated function calls
+    parser::WhoisParser,
+    ip::{ParsedIpData, IpParser},
 };
+use std::net::IpAddr;
 use psl::Psl;
 use std::{
     collections::HashMap,
@@ -45,8 +47,17 @@ pub struct WhoisService {
 pub struct WhoisResult {
     pub server: String,
     pub raw_data: String,
-    pub parsed_data: Option<ParsedWhoisData>,
+    /// Parsed WHOIS data - always present since text parsing never fails
+    /// (may contain empty/default fields if data couldn't be extracted)
+    pub parsed_data: ParsedWhoisData,
     pub parsing_analysis: Vec<String>,
+}
+
+/// Result of an IP WHOIS lookup
+pub struct IpWhoisResult {
+    pub server: String,
+    pub raw_data: String,
+    pub parsed_data: ParsedIpData,
 }
 
 impl WhoisService {
@@ -89,9 +100,95 @@ impl WhoisService {
         Ok(WhoisResult {
             server: final_server,
             raw_data: final_data,
-            parsed_data: Some(parsed_data),
+            parsed_data,
             parsing_analysis,
         })
+    }
+
+    /// Perform WHOIS lookup for an IP address
+    /// Uses ARIN as the initial server (handles referrals to other RIRs)
+    pub async fn lookup_ip(&self, ip: IpAddr) -> Result<IpWhoisResult, WhoisError> {
+        use crate::ip::Rir;
+        
+        let ip_str = ip.to_string();
+        
+        // Start with ARIN - it handles referrals to other RIRs
+        // ARIN is a good starting point as it refers to RIPE/APNIC/LACNIC/AFRINIC as needed
+        let initial_server = Rir::Arin.whois_server();
+        
+        // Perform the WHOIS query
+        // ARIN uses "n + <ip>" format to get network info without contacts
+        let query = format!("n + {}", ip_str);
+        let raw_data = self.raw_whois_query_custom(initial_server, &query).await?;
+        
+        // Check for RIR referrals in the response
+        let (final_server, final_data) = self.follow_ip_referrals(initial_server, &raw_data, &ip_str).await;
+        
+        // Parse the IP WHOIS data
+        let mut parsed_data = IpParser::parse_whois_data(&final_data);
+        
+        // Set the RIR based on the final server
+        parsed_data.rir = Some(Self::server_to_rir(&final_server));
+        
+        info!("✓ IP WHOIS lookup successful for {} via {}", ip_str, final_server);
+        
+        Ok(IpWhoisResult {
+            server: final_server,
+            raw_data: final_data,
+            parsed_data,
+        })
+    }
+    
+    /// Map WHOIS server to RIR name using the Rir enum
+    fn server_to_rir(server: &str) -> String {
+        use crate::ip::Rir;
+        
+        let server_lower = server.to_lowercase();
+        if server_lower.contains("arin") {
+            Rir::Arin.name().to_string()
+        } else if server_lower.contains("ripe") {
+            Rir::Ripe.name().to_string()
+        } else if server_lower.contains("apnic") {
+            Rir::Apnic.name().to_string()
+        } else if server_lower.contains("lacnic") {
+            Rir::Lacnic.name().to_string()
+        } else if server_lower.contains("afrinic") {
+            Rir::Afrinic.name().to_string()
+        } else {
+            server.to_string()
+        }
+    }
+    
+    /// Follow IP WHOIS referrals to other RIRs
+    async fn follow_ip_referrals(&self, initial_server: &str, initial_data: &str, ip: &str) -> (String, String) {
+        use crate::ip::Rir;
+        
+        // Use Rir enum for referral patterns - ensures consistency
+        let referral_rirs = [Rir::Ripe, Rir::Apnic, Rir::Lacnic, Rir::Afrinic];
+        
+        let initial_data_lower = initial_data.to_lowercase();
+        
+        for rir in referral_rirs.iter() {
+            let server = rir.whois_server();
+            // ARIN includes "Refer to <server>" or "ReferralServer: <server>" in responses
+            if initial_data_lower.contains(server) {
+                info!("IP WHOIS referral detected: {} -> {}", initial_server, rir.name());
+                
+                // Query the referred RIR
+                if let Ok(referred_data) = self.raw_whois_query(server, ip).await {
+                    return (server.to_string(), referred_data);
+                }
+            }
+        }
+        
+        // No referral found, return original data
+        (initial_server.to_string(), initial_data.to_string())
+    }
+    
+    /// Raw WHOIS query with custom query string (for IP lookups)
+    /// Reuses execute_whois_query to avoid code duplication
+    async fn raw_whois_query_custom(&self, server: &str, query: &str) -> Result<String, WhoisError> {
+        self.whois_query_with_semaphore(server, query, &self.domain_query_semaphore, "Semaphore closed").await
     }
 
     /// Extract TLD from domain using the embedded Public Suffix List
@@ -179,11 +276,17 @@ impl WhoisService {
         None
     }
 
+    /// Generate candidate WHOIS server hostnames for a TLD
+    /// 
+    /// Returns Vec because pattern count varies by TLD type:
+    /// - ccTLDs (2-char): 5 patterns (country-specific conventions)
+    /// - gTLDs: 3 patterns (standard conventions)
     fn generate_whois_patterns(tld: &str) -> Vec<String> {
-        // Intelligent pattern generation based on TLD characteristics
-        let mut patterns = Vec::new();
+        // Pre-allocate capacity based on TLD type
+        let capacity = if tld.len() == 2 { 5 } else { 3 };
+        let mut patterns = Vec::with_capacity(capacity);
         
-        // Most reliable patterns first
+        // Most reliable pattern first (ICANN requirement for new gTLDs)
         patterns.push(format!("whois.nic.{}", tld));
         
         // Country-specific patterns (for ccTLDs)

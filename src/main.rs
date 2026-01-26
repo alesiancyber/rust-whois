@@ -34,12 +34,17 @@ use whois_service::{
     config::Config,
     errors::WhoisError,
     WhoisResponse,
+    IpResponse,
 };
 #[cfg(feature = "openapi")]
 use whois_service::ParsedWhoisData;
+use std::net::IpAddr;
 
 // Import metrics module locally (API-only)
 mod metrics;
+
+#[cfg(feature = "openapi")]
+use whois_service::ip::ParsedIpData;
 
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
@@ -49,11 +54,14 @@ mod metrics;
         whois_lookup_path,
         whois_debug,
         whois_debug_path,
+        ip_lookup,
+        ip_lookup_path,
         health_check
     ),
-    components(schemas(HealthResponse, WhoisResponse, ParsedWhoisData)),
+    components(schemas(HealthResponse, WhoisResponse, ParsedWhoisData, IpResponse, ParsedIpData)),
     tags(
         (name = "whois", description = "Domain whois lookup operations"),
+        (name = "ip", description = "IP address lookup operations"),
         (name = "system", description = "System health and monitoring")
     ),
     info(
@@ -198,6 +206,19 @@ struct PathQueryParams {
     fresh: bool,
 }
 
+/// Query parameters for IP lookup
+#[derive(Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
+struct IpQuery {
+    /// IP address to lookup (e.g., "8.8.8.8" or "2001:4860:4860::8888")
+    #[cfg_attr(feature = "openapi", param(example = "8.8.8.8"))]
+    ip: String,
+    #[serde(default)]
+    /// Skip cache if true
+    #[cfg_attr(feature = "openapi", param(default = false))]
+    fresh: bool,
+}
+
 #[derive(Serialize)]
 #[cfg_attr(feature = "openapi", derive(ToSchema))]
 struct HealthResponse {
@@ -241,11 +262,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Build the application
     #[allow(unused_mut)]
     let mut app = Router::new()
+        // Domain WHOIS routes
         .route("/whois", get(whois_lookup))
         .route("/whois", post(whois_lookup_post))
         .route("/whois/:domain", get(whois_lookup_path))  // Path-based route for easier testing
         .route("/whois/debug", get(whois_debug))
         .route("/whois/debug/:domain", get(whois_debug_path))  // Path-based debug route
+        // IP WHOIS routes
+        .route("/ip", get(ip_lookup))
+        .route("/ip/:ip", get(ip_lookup_path))
+        // System routes
         .route("/health", get(health_check))
         .route("/metrics", get(metrics::metrics_handler))
         .with_state(app_state);
@@ -321,7 +347,7 @@ async fn three_tier_lookup(
             Ok(LookupResult {
                 server: format!("WHOIS: {}", whois_result.server),
                 raw_data: whois_result.raw_data,
-                parsed_data: whois_result.parsed_data,
+                parsed_data: Some(whois_result.parsed_data), // WHOIS parser always returns data
                 parsing_analysis: whois_result.parsing_analysis,
             })
         }
@@ -496,6 +522,115 @@ async fn whois_debug_path(
     let validated = ValidatedDomain::validate(domain)?;
     // Debug always uses fresh lookup (cache bypass)
     perform_whois_lookup(&state, validated.0, true, true).await
+}
+
+// ============== IP Lookup Handlers ==============
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/ip",
+    params(IpQuery),
+    responses(
+        (status = 200, description = "IP lookup successful", body = IpResponse),
+        (status = 400, description = "Invalid IP address"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "ip"
+))]
+async fn ip_lookup(
+    Query(params): Query<IpQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<IpResponse>, WhoisError> {
+    let ip = validate_ip(&params.ip)?;
+    // Note: params.fresh is accepted but IP caching not yet implemented
+    let _ = params.fresh;
+    perform_ip_lookup(&state, ip).await
+}
+
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/ip/{ip}",
+    params(
+        ("ip" = String, Path, description = "IP address to lookup (IPv4 or IPv6)", example = "8.8.8.8"),
+        PathQueryParams
+    ),
+    responses(
+        (status = 200, description = "IP lookup successful", body = IpResponse),
+        (status = 400, description = "Invalid IP address"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "ip"
+))]
+async fn ip_lookup_path(
+    Path(ip_str): Path<String>,
+    Query(params): Query<PathQueryParams>,
+    State(state): State<AppState>,
+) -> Result<Json<IpResponse>, WhoisError> {
+    let ip = validate_ip(&ip_str)?;
+    // Note: params.fresh is accepted but IP caching not yet implemented
+    let _ = params.fresh;
+    perform_ip_lookup(&state, ip).await
+}
+
+/// Validate and parse an IP address
+fn validate_ip(ip_str: &str) -> Result<IpAddr, WhoisError> {
+    ip_str.trim().parse::<IpAddr>()
+        .map_err(|_| WhoisError::InvalidIp(ip_str.to_string()))
+}
+
+/// Core IP lookup logic - uses three-tier system (RDAP -> WHOIS)
+/// Note: IP caching not yet implemented - all lookups are fresh
+async fn perform_ip_lookup(
+    state: &AppState,
+    ip: IpAddr,
+) -> Result<Json<IpResponse>, WhoisError> {
+    let start_time = std::time::Instant::now();
+    let ip_str = ip.to_string();
+    
+    // Increment request counter
+    metrics::increment_requests(&ip_str);
+    
+    // Tier 1: Try RDAP first (modern, structured JSON)
+    match state.rdap_service.lookup_ip(ip).await {
+        Ok(rdap_result) => {
+            let query_time = start_time.elapsed().as_millis() as u64;
+            metrics::record_query_time(query_time);
+            
+            return Ok(Json(IpResponse {
+                ip: ip_str,
+                server: format!("RDAP: {}", rdap_result.server),
+                raw_data: rdap_result.raw_data,
+                parsed_data: rdap_result.parsed_data,
+                cached: false,
+                query_time_ms: query_time,
+            }));
+        }
+        Err(e) => {
+            info!("⚠ IP RDAP failed for {}: {} - falling back to WHOIS", ip_str, e);
+        }
+    }
+    
+    // Tier 2: Fallback to WHOIS
+    match state.whois_service.lookup_ip(ip).await {
+        Ok(whois_result) => {
+            let query_time = start_time.elapsed().as_millis() as u64;
+            metrics::record_query_time(query_time);
+            
+            Ok(Json(IpResponse {
+                ip: ip_str,
+                server: format!("WHOIS: {}", whois_result.server),
+                raw_data: whois_result.raw_data,
+                parsed_data: whois_result.parsed_data,
+                cached: false,
+                query_time_ms: query_time,
+            }))
+        }
+        Err(e) => {
+            warn!("❌ IP lookup failed for {} (both RDAP and WHOIS)", ip_str);
+            metrics::increment_errors("ip_lookup_failed");
+            Err(e)
+        }
+    }
 }
 
 #[cfg_attr(feature = "openapi", utoipa::path(

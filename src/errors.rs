@@ -13,6 +13,9 @@ pub enum WhoisError {
     #[error("Invalid domain: {0}")]
     InvalidDomain(String),
 
+    #[error("Invalid IP address: {0}")]
+    InvalidIp(String),
+
     #[error("Unsupported TLD: {0}")]
     UnsupportedTld(String),
 
@@ -53,6 +56,7 @@ impl IntoResponse for WhoisError {
         let (status, error_message) = match &self {
             // Client errors - safe to expose details
             WhoisError::InvalidDomain(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            WhoisError::InvalidIp(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             WhoisError::UnsupportedTld(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             
             // Timeout - client should retry later
