@@ -1,0 +1,78 @@
+[package]
+name = "whois-service"
+version = "0.1.1"
+edition = "2021"
+description = "High-performance whois lookup service and library with dynamic TLD discovery"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/alesiancyber/rust-whois"
+keywords = ["whois", "dns", "domain", "lookup", "async"]
+categories = ["network-programming", "web-programming"]
+
+# Library configuration
+[lib]
+name = "whois_service"
+path = "src/lib.rs"
+
+# Binary configuration  
+[[bin]]
+name = "whois-service"
+path = "src/main.rs"
+required-features = ["server"]
+
+
+
+# Feature flags
+[features]
+default = ["server"]
+server = ["axum", "tower", "tower-http", "metrics", "metrics-exporter-prometheus"]
+openapi = ["utoipa", "utoipa-swagger-ui"]
+
+
+[dependencies]
+# Core library dependencies
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+thiserror = "1.0"
+config = "0.14"
+regex = "1.0"
+futures = "0.3"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
+publicsuffix = "2.2"
+once_cell = "1.19"
+moka = { version = "0.12", features = ["future"] }
+url = "2.5"
+
+# Metrics dependencies (API only)
+metrics = { version = "0.22", optional = true }
+metrics-exporter-prometheus = { version = "0.13", optional = true }
+
+# Optional dependencies for server feature
+axum = { version = "0.7", features = ["macros", "tracing"], optional = true }
+tower = { version = "0.4", features = ["timeout", "limit"], optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-gzip"], optional = true }
+
+# Optional OpenAPI dependencies
+utoipa = { version = "5.0", features = ["axum_extras"], optional = true }
+utoipa-swagger-ui = { version = "8.0", features = ["axum"], optional = true }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[build-dependencies]
+tokio = { version = "1.0", features = ["full"] }
+reqwest = { version = "0.11", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+once_cell = "1.19" 
