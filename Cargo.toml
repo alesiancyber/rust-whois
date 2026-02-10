@@ -48,6 +48,13 @@ psl = "2.1"  # Has embedded PSL data, updated with crate releases
 once_cell = "1.19"
 moka = { version = "0.12", features = ["future"] }
 url = "2.5"
+addr = "0.15"  # PSL-aware domain parsing and validation
+dateparser = "0.2"  # Comprehensive date/time string parsing
+
+# Performance & reliability improvements
+crossbeam = "0.8"  # Lock-free data structures for buffer pool
+backon = "0.4"  # Retry with exponential backoff
+governor = "0.6"  # Token bucket rate limiting for internal protection
 
 # Metrics dependencies (API only)
 metrics = { version = "0.22", optional = true }

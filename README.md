@@ -11,8 +11,6 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 - **Calculated fields** for threat detection: `created_ago`, `updated_ago`, `expires_in`
 - **Dual-use**: Import as a Rust library or run as an HTTP API
 
-> **Note**: This is the `dev-ip-lookup` branch with full IP address support. See `main` branch for stable domain-only lookups.
-
 ## Quick Start
 
 ### As HTTP Service
@@ -20,7 +18,6 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 ```bash
 git clone https://github.com/alesiancyber/rust-whois.git
 cd rust-whois
-git checkout dev-ip-lookup
 cargo run --release
 ```
 
@@ -28,8 +25,11 @@ cargo run --release
 # Domain lookup
 curl "http://localhost:3000/whois/google.com"
 
-# IP address lookup
-curl "http://localhost:3000/ip/8.8.8.8"
+# IP address lookup (IPv4)
+curl "http://localhost:3000/whois/8.8.8.8"
+
+# IP address lookup (IPv6)
+curl "http://localhost:3000/whois/2001:4860:4860::8888"
 
 # Health check
 curl "http://localhost:3000/health"
@@ -39,25 +39,29 @@ curl "http://localhost:3000/health"
 
 ```toml
 [dependencies]
-whois-service = "0.1"
+whois-service = "0.2.0"
 ```
 
 ```rust
 use whois_service::WhoisClient;
-use std::net::IpAddr;
 
 #[tokio::main]
-async fn main() {
-    let client = WhoisClient::new().await;
-    
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WhoisClient::new().await?;
+
     // Domain lookup
-    let domain = client.lookup("example.com").await.unwrap();
-    println!("Created {} days ago", domain.parsed_data.created_ago.unwrap_or(0));
-    
-    // IP lookup
-    let ip: IpAddr = "8.8.8.8".parse().unwrap();
-    let ip_info = client.lookup_ip(ip).await.unwrap();
-    println!("Organization: {}", ip_info.parsed_data.organization.unwrap_or_default());
+    let domain = client.lookup("example.com").await?;
+    println!("Created {} days ago", domain.parsed_data.unwrap().created_ago.unwrap_or(0));
+
+    // IP lookup (auto-detects IPv4 or IPv6)
+    let ip_info = client.lookup("8.8.8.8").await?;
+    println!("Network: {:?}", ip_info.parsed_data);
+
+    // IPv6 lookup
+    let ipv6_info = client.lookup("2001:4860:4860::8888").await?;
+    println!("IPv6 Network: {:?}", ipv6_info.parsed_data);
+
+    Ok(())
 }
 ```
 
@@ -65,20 +69,27 @@ async fn main() {
 
 ## API Endpoints
 
-### Domain Lookups
+All endpoints support **both domains and IP addresses** (auto-detection).
+
+### WHOIS/IP Lookups
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /whois?domain=example.com` | Query via parameter |
-| `GET /whois/:domain` | Query via path |
-| `GET /whois/debug/:domain` | Include parsing analysis |
+| `GET /whois?domain={query}` | Query via parameter (domain or IP) |
+| `GET /whois/{query}` | Query via path (domain or IP) |
+| `GET /whois/debug/{query}` | Include parsing analysis |
 
-### IP Address Lookups
+**Examples:**
+```bash
+# Domain lookups
+curl "http://localhost:3000/whois/google.com"
+curl "http://localhost:3000/whois?domain=example.com"
 
-| Endpoint | Description |
-|----------|-------------|
-| `GET /ip?ip=8.8.8.8` | Query via parameter |
-| `GET /ip/:ip` | Query via path (IPv4 or IPv6) |
+# IP lookups (same endpoints)
+curl "http://localhost:3000/whois/8.8.8.8"
+curl "http://localhost:3000/whois/2001:4860:4860::8888"
+curl "http://localhost:3000/whois?domain=8.8.8.8"
+```
 
 ### System
 
@@ -88,9 +99,9 @@ async fn main() {
 | `GET /metrics` | Prometheus metrics |
 | `GET /docs` | OpenAPI/Swagger UI (with `openapi` feature) |
 
-## Response Formats
+## Response Format
 
-### Domain Response
+**Unified response structure** for both domains and IP addresses:
 
 ```json
 {
@@ -101,43 +112,27 @@ async fn main() {
     "creation_date": "1997-09-15T04:00:00Z",
     "expiration_date": "2028-09-14T04:00:00Z",
     "name_servers": ["NS1.EXAMPLE.COM", "NS2.EXAMPLE.COM"],
+    "status": ["clientTransferProhibited"],
     "created_ago": 10360,
-    "expires_in": 961
+    "expires_in": 961,
+    "updated_ago": 45
   },
   "cached": false,
   "query_time_ms": 450
 }
 ```
 
-### IP Response
-
-```json
-{
-  "ip": "8.8.8.8",
-  "server": "RDAP: https://rdap.arin.net/registry/",
-  "parsed_data": {
-    "range": "8.8.8.0 - 8.8.8.255",
-    "net_name": "GOGL",
-    "organization": "Google LLC",
-    "net_handle": "NET-8-8-8-0-2",
-    "start_address": "8.8.8.0",
-    "end_address": "8.8.8.255",
-    "registration_date": "2023-12-28T17:24:33-05:00"
-  },
-  "cached": false,
-  "query_time_ms": 350
-}
-```
+**Note**: The `domain` field contains either a domain name OR an IP address. For IP lookups, the `parsed_data.registrar` field often contains the network name or organization.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Fresh domain lookup | 450-900ms |
-| Fresh IP lookup | 250-500ms |
+| Fresh lookup (domain or IP) | 250-900ms |
 | Cached lookup | <5ms |
 | Throughput | 800+ lookups/min |
 | Cache capacity | 10K+ entries |
+| Auto-detection overhead | <1μs |
 
 ## Configuration
 
@@ -153,13 +148,6 @@ RUST_LOG=whois_service=info    # Log level
 ```
 
 The service auto-adapts to available system resources (memory, CPU cores).
-
-## Development Branches
-
-| Branch | Description |
-|--------|-------------|
-| `main` | Stable release - domain lookups only |
-| `dev-ip-lookup` | **This branch** - adds IPv4/IPv6 address lookups |
 
 ## Build
 

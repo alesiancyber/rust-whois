@@ -69,3 +69,13 @@ book/
 # Flamegraph profiling
 flamegraph.svg
 perf.data* 
+# Internal development documents (keep locally, don't commit)
+DOCUMENTATION_ASSESSMENT.md
+CODE_REVIEW_REPORT.md
+API_IP_SUPPORT_SUMMARY.md
+DOCUMENTATION_UPDATE_SUMMARY.md
+GITHUB_RELEASE_CHECKLIST.md
+RELEASE_NOTES_v0.2.0.md
+
+# Claude Code artifacts
+.claude/

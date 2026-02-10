@@ -138,7 +138,7 @@ impl Config {
     fn calculate_max_response_size(available_memory: u64) -> usize {
         // Use 0.1% of available memory, capped between 1MB and 10MB
         let calculated = (available_memory as f64 * 0.001) as usize;
-        calculated.max(1024 * 1024).min(10 * 1024 * 1024)
+        calculated.clamp(1024 * 1024, 10 * 1024 * 1024)
     }
 
     fn calculate_cache_size(available_memory: u64) -> u64 {
@@ -223,4 +223,185 @@ struct SystemCapabilities {
     concurrent_whois_queries: usize,
     buffer_pool_size: usize,
     buffer_size: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_load_defaults() {
+        // Should load with defaults
+        let config = Config::load();
+        assert!(config.is_ok());
+
+        let config = config.unwrap();
+        assert!(config.port > 0);
+        assert!(config.whois_timeout_seconds > 0);
+        assert!(config.max_response_size > 0);
+        assert!(config.cache_ttl_seconds > 0);
+        assert!(config.cache_max_entries > 0);
+        assert!(config.max_referrals > 0);
+        assert!(config.discovery_timeout_seconds > 0);
+        assert!(config.concurrent_whois_queries > 0);
+        assert!(config.buffer_pool_size > 0);
+        assert!(config.buffer_size > 0);
+    }
+
+    #[test]
+    fn test_config_validation() {
+        let mut config = Config::load().unwrap();
+
+        // Test valid config
+        assert!(config.validate().is_ok());
+
+        // Test invalid port
+        config.port = 0;
+        assert!(config.validate().is_err());
+        config.port = 3000;
+
+        // Test invalid timeout
+        config.whois_timeout_seconds = 0;
+        assert!(config.validate().is_err());
+        config.whois_timeout_seconds = 30;
+
+        // Test invalid buffer size
+        config.buffer_size = 0;
+        assert!(config.validate().is_err());
+        config.buffer_size = 4096;
+
+        // Test invalid buffer pool size
+        config.buffer_pool_size = 0;
+        assert!(config.validate().is_err());
+        config.buffer_pool_size = 10;
+
+        // Test invalid max response size
+        config.max_response_size = 0;
+        assert!(config.validate().is_err());
+        config.max_response_size = 1024 * 1024;
+
+        // Test invalid concurrent queries
+        config.concurrent_whois_queries = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_calculate_max_response_size() {
+        // Small memory (2GB)
+        let size = Config::calculate_max_response_size(2 * 1024 * 1024 * 1024);
+        assert!(size >= 1024 * 1024); // At least 1MB
+        assert!(size <= 10 * 1024 * 1024); // At most 10MB
+
+        // Large memory (16GB)
+        let size = Config::calculate_max_response_size(16 * 1024 * 1024 * 1024);
+        assert!(size >= 1024 * 1024);
+        assert!(size <= 10 * 1024 * 1024);
+
+        // Very small memory
+        let size = Config::calculate_max_response_size(512 * 1024 * 1024);
+        assert_eq!(size, 1024 * 1024); // Should clamp to minimum
+    }
+
+    #[test]
+    fn test_calculate_cache_size() {
+        // Low memory (2GB)
+        let size = Config::calculate_cache_size(2 * 1024 * 1024 * 1024);
+        assert_eq!(size, 1000);
+
+        // Medium memory (4GB)
+        let size = Config::calculate_cache_size(4 * 1024 * 1024 * 1024);
+        assert_eq!(size, 5000);
+
+        // High memory (16GB)
+        let size = Config::calculate_cache_size(16 * 1024 * 1024 * 1024);
+        assert_eq!(size, 10000);
+
+        // Very high memory (32GB)
+        let size = Config::calculate_cache_size(32 * 1024 * 1024 * 1024);
+        assert_eq!(size, 25000);
+    }
+
+    #[test]
+    fn test_calculate_buffer_pool_size() {
+        // Low memory
+        let size = Config::calculate_buffer_pool_size(2 * 1024 * 1024 * 1024);
+        assert_eq!(size, 10);
+
+        // Medium memory
+        let size = Config::calculate_buffer_pool_size(4 * 1024 * 1024 * 1024);
+        assert_eq!(size, 50);
+
+        // High memory
+        let size = Config::calculate_buffer_pool_size(16 * 1024 * 1024 * 1024);
+        assert_eq!(size, 100);
+
+        // Very high memory
+        let size = Config::calculate_buffer_pool_size(32 * 1024 * 1024 * 1024);
+        assert_eq!(size, 200);
+    }
+
+    #[test]
+    fn test_calculate_buffer_size() {
+        // Low memory
+        let size = Config::calculate_buffer_size(2 * 1024 * 1024 * 1024);
+        assert_eq!(size, 4096);
+
+        // Medium memory
+        let size = Config::calculate_buffer_size(4 * 1024 * 1024 * 1024);
+        assert_eq!(size, 8192);
+
+        // High memory
+        let size = Config::calculate_buffer_size(16 * 1024 * 1024 * 1024);
+        assert_eq!(size, 16384);
+
+        // Very high memory
+        let size = Config::calculate_buffer_size(32 * 1024 * 1024 * 1024);
+        assert_eq!(size, 32768);
+    }
+
+    #[test]
+    fn test_get_cpu_cores() {
+        let cores = Config::get_cpu_cores();
+        assert!(cores > 0);
+        assert!(cores <= 256); // Reasonable upper bound
+    }
+
+    #[test]
+    fn test_is_production_environment() {
+        // Save original env vars
+        let original_env = std::env::var("ENVIRONMENT").ok();
+        let original_env2 = std::env::var("ENV").ok();
+
+        // Test production
+        std::env::set_var("ENVIRONMENT", "production");
+        assert!(Config::is_production_environment());
+
+        std::env::set_var("ENVIRONMENT", "prod");
+        assert!(Config::is_production_environment());
+
+        std::env::set_var("ENVIRONMENT", "PRODUCTION");
+        assert!(Config::is_production_environment());
+
+        // Test non-production
+        std::env::set_var("ENVIRONMENT", "development");
+        assert!(!Config::is_production_environment());
+
+        std::env::set_var("ENVIRONMENT", "dev");
+        assert!(!Config::is_production_environment());
+
+        std::env::remove_var("ENVIRONMENT");
+        assert!(!Config::is_production_environment());
+
+        // Restore original env vars
+        if let Some(val) = original_env {
+            std::env::set_var("ENVIRONMENT", val);
+        } else {
+            std::env::remove_var("ENVIRONMENT");
+        }
+        if let Some(val) = original_env2 {
+            std::env::set_var("ENV", val);
+        } else {
+            std::env::remove_var("ENV");
+        }
+    }
 } 

@@ -8,7 +8,6 @@ use crate::{
     errors::WhoisError,
     ParsedWhoisData,
     tld::extract_tld,
-    dates,
 };
 use once_cell::sync::Lazy;  // Used by include!(rdap_mappings.rs)
 use serde::Deserialize;
@@ -24,6 +23,10 @@ use url::Url;
 // RDAP Bootstrap Service URL for dynamic discovery
 const RDAP_BOOTSTRAP_URL: &str = "https://data.iana.org/rdap/dns.json";
 
+/// Maximum retry attempts for transient failures
+/// Uses exponential backoff: immediate, +1s, +2s
+const MAX_RETRY_ATTEMPTS: usize = 3;
+
 // Include the auto-generated RDAP mappings from build script
 include!(concat!(env!("OUT_DIR"), "/rdap_mappings.rs"));
 
@@ -38,12 +41,11 @@ pub struct RdapService {
     discovery_semaphore: Arc<Semaphore>,
 }
 
-pub struct RdapResult {
-    pub server: String,
-    pub raw_data: String,
-    pub parsed_data: Option<ParsedWhoisData>,
-    pub parsing_analysis: Vec<String>,
-}
+/// Type alias for RDAP lookup results
+///
+/// Uses the unified LookupResult structure to eliminate duplication
+/// with WHOIS results. Maintains backward compatibility.
+pub type RdapResult = crate::LookupResult;
 
 #[derive(Debug, Clone, Deserialize)]
 struct RdapBootstrap {
@@ -101,7 +103,7 @@ impl RdapService {
             .user_agent("whois-service/0.1.0 (RDAP client)")
             .gzip(true)
             .build()
-            .map_err(|e| WhoisError::HttpError(e))?;
+            .map_err(WhoisError::HttpError)?;
 
         let service = Self {
             config: config.clone(),
@@ -120,28 +122,62 @@ impl RdapService {
 
     /// Perform RDAP lookup for a domain
     /// Returns structured data that doesn't require parsing
+    /// Assumes domain is already validated and normalized by ValidatedDomain
     pub async fn lookup(&self, domain: &str) -> Result<RdapResult, WhoisError> {
-        let domain = domain.trim().to_lowercase();
-        
-        // Basic validation - assume domain is pre-parsed and valid
-        if domain.is_empty() || !domain.contains('.') {
-            return Err(WhoisError::InvalidDomain(domain));
-        }
-        
+        // Domain is already validated and normalized by ValidatedDomain - no need to re-check
+
         // Extract TLD from the domain using shared PSL-based extraction
-        let tld = extract_tld(&domain)?;
+        let tld = extract_tld(domain)?;
         
         // Find appropriate RDAP server (hybrid: hardcoded + bootstrap discovery)
         let rdap_server = self.find_rdap_server(&tld).await?;
         
         // Perform RDAP query
-        let raw_data = self.query_rdap_server(&rdap_server, &domain).await?;
+        let raw_data = self.query_rdap_server(&rdap_server, domain).await?;
         
         // Parse RDAP JSON response into our standard format
         let (parsed_data, parsing_analysis) = Self::parse_rdap_response(&raw_data);
         
         Ok(RdapResult {
             server: rdap_server,
+            raw_data,
+            parsed_data,
+            parsing_analysis,
+        })
+    }
+
+    /// Perform RDAP lookup for an IP address (IPv4 or IPv6)
+    ///
+    /// RDAP provides better structured data for IPs than traditional WHOIS.
+    /// Assumes IP is already validated.
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_addr` - Validated IP address string
+    ///
+    /// # Returns
+    ///
+    /// RdapResult containing server info, raw JSON data, and parsed fields
+    pub async fn lookup_ip(&self, ip_addr: &str) -> Result<RdapResult, WhoisError> {
+        use crate::ip::{ValidatedIpAddress, detect_rir};
+
+        // Validate IP and detect RIR
+        let validated_ip = ValidatedIpAddress::new(ip_addr)?;
+        let rir = detect_rir(&validated_ip)?;
+
+        // Get RDAP server for this RIR
+        let rdap_server = rir.rdap_server();
+
+        debug!("Using RIR RDAP server for IP {}: {} ({})", ip_addr, rdap_server, format!("{:?}", rir));
+
+        // Perform RDAP query for IP
+        let raw_data = self.query_rdap_server_ip(rdap_server, ip_addr).await?;
+
+        // Parse RDAP JSON response for IP
+        let (parsed_data, parsing_analysis) = Self::parse_rdap_ip_response(&raw_data);
+
+        Ok(RdapResult {
+            server: rdap_server.to_string(),
             raw_data,
             parsed_data,
             parsing_analysis,
@@ -166,10 +202,13 @@ impl RdapService {
 
         // Dynamic discovery using IANA bootstrap service
         if let Some(server) = self.discover_rdap_server_bootstrap(tld).await {
-            // Cache the discovered server
+            // Cache the discovered server using double-checked locking pattern
             {
                 let mut servers = self.tld_servers.write().await;
-                servers.insert(tld.to_string(), server.clone());
+                // Check again in case another thread just inserted it (avoids duplicate work)
+                if !servers.contains_key(tld) {
+                    servers.insert(tld.to_string(), server.clone());
+                }
             }
             return Ok(server);
         }
@@ -221,7 +260,7 @@ impl RdapService {
             .get(RDAP_BOOTSTRAP_URL)
             .send()
             .await
-            .map_err(|e| WhoisError::HttpError(e))?;
+            .map_err(WhoisError::HttpError)?;
 
         if !response.status().is_success() {
             return Err(WhoisError::Internal(format!("Bootstrap fetch failed with status: {}", response.status())));
@@ -230,55 +269,85 @@ impl RdapService {
         let bootstrap_data: RdapBootstrap = response
             .json()
             .await
-            .map_err(|e| WhoisError::HttpError(e))?;
+            .map_err(WhoisError::HttpError)?;
 
         info!("Successfully fetched RDAP bootstrap data");
         Ok(bootstrap_data)
     }
 
-    async fn query_rdap_server(&self, server: &str, domain: &str) -> Result<String, WhoisError> {
+    /// Generic RDAP query method for both domains and IPs
+    ///
+    /// Consolidates duplicate code between domain and IP queries.
+    /// The only differences are the URL path segment and debug messages.
+    async fn query_rdap_resource(&self, server: &str, resource_type: &str, query: &str) -> Result<String, WhoisError> {
+        use backon::{ExponentialBuilder, Retryable};
+
         let _permit = self.query_semaphore.acquire().await
             .map_err(|_| WhoisError::Internal("Semaphore acquisition failed".to_string()))?;
 
-        // Construct RDAP URL using proper URL parsing for security
-        let base_url = Url::parse(server)
+        // Construct RDAP URL with proper percent-encoding for security
+        let mut url = Url::parse(server)
             .map_err(|e| WhoisError::Internal(format!("Invalid RDAP server URL '{}': {}", server, e)))?;
-        
-        let url = base_url.join(&format!("domain/{}", domain))
-            .map_err(|e| WhoisError::Internal(format!("Failed to construct RDAP URL: {}", e)))?;
 
-        debug!("Querying RDAP server: {}", url);
+        // Use path_segments_mut for automatic URL encoding
+        url.path_segments_mut()
+            .map_err(|_| WhoisError::Internal("Cannot construct RDAP URL (base URL cannot be a base)".to_string()))?
+            .push(resource_type)
+            .push(query);
 
-        let response = self.client
-            .get(url)
-            .header("Accept", "application/rdap+json, application/json")
-            .send()
-            .await
-            .map_err(|e| WhoisError::HttpError(e))?;
+        debug!("Querying RDAP server for {}: {}", resource_type, url);
 
-        if !response.status().is_success() {
-            return Err(WhoisError::Internal(format!("RDAP query failed with status: {}", response.status())));
-        }
+        // Retry transient HTTP errors with exponential backoff
+        // Max 3 attempts: immediate, +1s, +2s
+        let raw_data = (|| async {
+            let response = self.client
+                .get(url.clone())
+                .header("Accept", "application/rdap+json, application/json")
+                .send()
+                .await
+                .map_err(WhoisError::HttpError)?;
 
-        // Check content-length header before downloading (if available)
-        if let Some(content_length) = response.content_length() {
-            if content_length as usize > self.config.max_response_size {
+            if !response.status().is_success() {
+                return Err(WhoisError::Internal(format!("RDAP {} query failed with status: {}", resource_type, response.status())));
+            }
+
+            // Check content-length header before downloading (if available)
+            if let Some(content_length) = response.content_length() {
+                if content_length as usize > self.config.max_response_size {
+                    return Err(WhoisError::ResponseTooLarge);
+                }
+            }
+
+            let raw_data = response
+                .text()
+                .await
+                .map_err(WhoisError::HttpError)?;
+
+            // Check actual size (content-length might be missing or wrong)
+            if raw_data.len() > self.config.max_response_size {
                 return Err(WhoisError::ResponseTooLarge);
             }
-        }
 
-        let raw_data = response
-            .text()
-            .await
-            .map_err(|e| WhoisError::HttpError(e))?;
+            Ok(raw_data)
+        })
+        .retry(&ExponentialBuilder::default().with_max_times(MAX_RETRY_ATTEMPTS))
+        .when(|e: &WhoisError| {
+            // Retry only on transient network errors, not on client errors
+            matches!(e, WhoisError::Timeout | WhoisError::HttpError(_))
+        })
+        .await?;
 
-        // Check actual size (content-length might be missing or wrong)
-        if raw_data.len() > self.config.max_response_size {
-            return Err(WhoisError::ResponseTooLarge);
-        }
-
-        debug!("RDAP response length: {} bytes", raw_data.len());
+        debug!("RDAP {} response length: {} bytes", resource_type, raw_data.len());
         Ok(raw_data)
+    }
+
+    async fn query_rdap_server(&self, server: &str, domain: &str) -> Result<String, WhoisError> {
+        self.query_rdap_resource(server, "domain", domain).await
+    }
+
+    /// Query RDAP server for IP address information
+    async fn query_rdap_server_ip(&self, server: &str, ip: &str) -> Result<String, WhoisError> {
+        self.query_rdap_resource(server, "ip", ip).await
     }
 
     fn parse_rdap_response(raw_data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
@@ -290,21 +359,7 @@ impl RdapService {
         
         match rdap_response {
             Ok(rdap) => {
-                let mut parsed = ParsedWhoisData {
-                    registrar: None,
-                    creation_date: None,
-                    expiration_date: None,
-                    updated_date: None,
-                    name_servers: Vec::new(),
-                    status: Vec::new(),
-                    registrant_name: None,
-                    registrant_email: None,
-                    admin_email: None,
-                    tech_email: None,
-                    created_ago: None,
-                    updated_ago: None,
-                    expires_in: None,
-                };
+                let mut parsed = ParsedWhoisData::new();
 
                 // Extract name servers
                 if let Some(ref nameservers) = rdap.name_servers {
@@ -366,16 +421,9 @@ impl RdapService {
                 }
 
                 // Calculate date-based fields using shared date utilities
-                let (created_ago, updated_ago, expires_in) = dates::calculate_date_fields(
-                    &parsed.creation_date,
-                    &parsed.updated_date,
-                    &parsed.expiration_date,
-                );
-                parsed.created_ago = created_ago;
-                parsed.updated_ago = updated_ago;
-                parsed.expires_in = expires_in;
+                parsed.calculate_age_fields();
 
-                analysis.push(format!("✓ RDAP JSON parsed successfully"));
+                analysis.push("✓ RDAP JSON parsed successfully".to_string());
                 analysis.push(format!("✓ Registrar: {}", parsed.registrar.as_ref().unwrap_or(&"NOT FOUND".to_string())));
                 analysis.push(format!("✓ Creation Date: {}", parsed.creation_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
                 analysis.push(format!("✓ Expiration Date: {}", parsed.expiration_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
@@ -386,6 +434,133 @@ impl RdapService {
             }
             Err(e) => {
                 analysis.push(format!("❌ Failed to parse RDAP JSON: {}", e));
+                analysis.push("Raw response (first 500 chars):".to_string());
+                analysis.push(raw_data.chars().take(500).collect::<String>());
+                (None, analysis)
+            }
+        }
+    }
+
+    /// Parse RDAP IP response (different structure than domain responses)
+    ///
+    /// IP RDAP responses have different fields:
+    /// - startAddress, endAddress (IP range)
+    /// - cidr0_cidrs (CIDR notation)
+    /// - name (network name)
+    /// - type (allocation type)
+    /// - entities (organizations, contacts)
+    fn parse_rdap_ip_response(raw_data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
+        let mut analysis = Vec::new();
+        analysis.push("=== RDAP IP PARSING ANALYSIS ===".to_string());
+
+        // Parse as generic JSON (IP RDAP structure differs from domain RDAP)
+        let rdap_response: Result<serde_json::Value, _> = serde_json::from_str(raw_data);
+
+        match rdap_response {
+            Ok(json) => {
+                let mut parsed = ParsedWhoisData::new();
+
+                // Extract network name (use as "registrar" for consistency)
+                if let Some(name) = json.get("name").and_then(|v| v.as_str()) {
+                    parsed.registrar = Some(name.to_string());
+                    analysis.push(format!("✓ Network Name: {}", name));
+                }
+
+                // Extract CIDR blocks
+                if let Some(cidr_array) = json.get("cidr0_cidrs").and_then(|v| v.as_array()) {
+                    for cidr in cidr_array {
+                        if let Some(cidr_str) = cidr.get("v4prefix").or_else(|| cidr.get("v6prefix")).and_then(|v| v.as_str()) {
+                            analysis.push(format!("✓ CIDR: {}", cidr_str));
+                        }
+                    }
+                }
+
+                // Extract IP range
+                if let (Some(start), Some(end)) = (
+                    json.get("startAddress").and_then(|v| v.as_str()),
+                    json.get("endAddress").and_then(|v| v.as_str())
+                ) {
+                    analysis.push(format!("✓ IP Range: {} - {}", start, end));
+                }
+
+                // Extract status
+                if let Some(status) = json.get("status").and_then(|v| v.as_array()) {
+                    parsed.status = status.iter()
+                        .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                        .collect();
+                    analysis.push(format!("✓ Status: {} entries", parsed.status.len()));
+                }
+
+                // Extract events (registration, last update)
+                if let Some(events) = json.get("events").and_then(|v| v.as_array()) {
+                    for event in events {
+                        if let (Some(action), Some(date)) = (
+                            event.get("eventAction").and_then(|v| v.as_str()),
+                            event.get("eventDate").and_then(|v| v.as_str())
+                        ) {
+                            match action {
+                                "registration" => {
+                                    parsed.creation_date = Some(date.to_string());
+                                    analysis.push(format!("✓ Registration Date: {}", date));
+                                },
+                                "last changed" | "last update of RDAP database" => {
+                                    if parsed.updated_date.is_none() {
+                                        parsed.updated_date = Some(date.to_string());
+                                        analysis.push(format!("✓ Last Updated: {}", date));
+                                    }
+                                },
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                // Extract entities (organizations, contacts)
+                if let Some(entities) = json.get("entities").and_then(|v| v.as_array()) {
+                    for entity in entities {
+                        // Extract organization name from vCard
+                        if let Some(vcard) = entity.get("vcardArray") {
+                            if let Some(name) = Self::extract_name_from_vcard(vcard) {
+                                if parsed.registrant_name.is_none() {
+                                    parsed.registrant_name = Some(name.clone());
+                                    analysis.push(format!("✓ Organization: {}", name));
+                                }
+                            }
+                            if let Some(email) = Self::extract_email_from_vcard(vcard) {
+                                // Determine role from entity roles
+                                if let Some(roles) = entity.get("roles").and_then(|v| v.as_array()) {
+                                    let role_strings: Vec<String> = roles.iter()
+                                        .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                                        .collect();
+
+                                    if role_strings.contains(&"technical".to_string()) && parsed.tech_email.is_none() {
+                                        parsed.tech_email = Some(email.clone());
+                                        analysis.push(format!("✓ Tech Email: {}", email));
+                                    } else if role_strings.contains(&"abuse".to_string()) && parsed.admin_email.is_none() {
+                                        parsed.admin_email = Some(email.clone());
+                                        analysis.push(format!("✓ Abuse Email: {}", email));
+                                    } else if parsed.registrant_email.is_none() {
+                                        parsed.registrant_email = Some(email);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Calculate date-based fields
+                parsed.calculate_age_fields();
+
+                analysis.push("\n=== SUMMARY ===".to_string());
+                analysis.push(format!("Network/Organization: {}", parsed.registrar.as_ref().unwrap_or(&"NOT FOUND".to_string())));
+                analysis.push(format!("Created: {}", parsed.creation_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
+                analysis.push(format!("Updated: {}", parsed.updated_date.as_ref().unwrap_or(&"NOT FOUND".to_string())));
+                analysis.push(format!("Status entries: {}", parsed.status.len()));
+
+                (Some(parsed), analysis)
+            }
+            Err(e) => {
+                analysis.push(format!("❌ Failed to parse RDAP IP JSON: {}", e));
                 analysis.push("Raw response (first 500 chars):".to_string());
                 analysis.push(raw_data.chars().take(500).collect::<String>());
                 (None, analysis)

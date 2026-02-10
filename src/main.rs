@@ -23,7 +23,6 @@ use tower_http::{
 use tracing::{info, warn};
 
 // Constants to eliminate magic numbers
-const CACHE_WRITE_TIMEOUT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 // Import from the library instead of local modules
@@ -34,7 +33,7 @@ use whois_service::{
     config::Config,
     errors::WhoisError,
     WhoisResponse,
-    ValidatedDomain,
+    ValidatedQuery,
 };
 #[cfg(feature = "openapi")]
 use whois_service::ParsedWhoisData;
@@ -59,8 +58,8 @@ mod metrics;
     ),
     info(
         title = "Whois Service API",
-        version = "0.1.0",
-        description = "High-performance whois lookup service with RDAP support for cybersecurity applications. Features RDAP-first lookup with intelligent fallback to traditional whois.",
+        version = "0.2.0",
+        description = "High-performance whois lookup service with RDAP support for cybersecurity applications. Supports domain names, IPv4, and IPv6 addresses. Features RDAP-first lookup with intelligent fallback to traditional whois.",
         contact(
             name = "Whois Service Support",
             email = "support@example.com"
@@ -81,6 +80,7 @@ pub struct AppState {
     whois_service: Arc<WhoisService>,
     rdap_service: Arc<RdapService>,
     cache_service: Arc<CacheService>,
+    rate_limiter: Arc<whois_service::rate_limiter::RateLimiter>,
     /// Application start time for uptime tracking
     start_time: std::time::Instant,
 }
@@ -97,12 +97,17 @@ struct LookupResult {
     parsing_analysis: Vec<String>,
 }
 
-/// Validate domain from query parameters (wrapper for metrics integration)
-fn validate_domain_with_metrics(domain: &str) -> Result<ValidatedDomain, WhoisError> {
-    match ValidatedDomain::new(domain) {
+/// Validate query (domain or IP) from query parameters (wrapper for metrics integration)
+fn validate_query_with_metrics(query: &str) -> Result<ValidatedQuery, WhoisError> {
+    match ValidatedQuery::new(query) {
         Ok(validated) => Ok(validated),
         Err(e) => {
-            metrics::increment_errors("invalid_domain");
+            // Increment appropriate error metric based on error type
+            match &e {
+                WhoisError::InvalidDomain(_) => metrics::increment_errors("invalid_domain"),
+                WhoisError::InvalidIpAddress(_) => metrics::increment_errors("invalid_ip"),
+                _ => metrics::increment_errors("invalid_query"),
+            }
             Err(e)
         }
     }
@@ -111,8 +116,8 @@ fn validate_domain_with_metrics(domain: &str) -> Result<ValidatedDomain, WhoisEr
 #[derive(Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 struct WhoisQuery {
-    /// Domain name to lookup (e.g., "example.com")
-    /// Must be a valid, pre-parsed domain name
+    /// Domain name or IP address to lookup (e.g., "example.com" or "8.8.8.8")
+    /// Supports domains, IPv4, and IPv6 addresses
     #[cfg_attr(feature = "openapi", param(example = "google.com"))]
     domain: String,
     #[serde(default)]
@@ -160,6 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let whois_service = Arc::new(WhoisService::new(config.clone()).await?);
     let rdap_service = Arc::new(RdapService::new(config.clone()).await?);
     let cache_service = Arc::new(CacheService::new(config.clone()));
+    let rate_limiter = Arc::new(whois_service::rate_limiter::RateLimiter::new());
 
     // Initialize metrics
     metrics::init_metrics();
@@ -168,6 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         whois_service,
         rdap_service,
         cache_service,
+        rate_limiter,
         start_time: std::time::Instant::now(),
     };
 
@@ -209,14 +216,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Metrics: http://{}/metrics", addr);
     #[cfg(feature = "openapi")]
     info!("API Documentation: http://{}/docs", addr);
-    info!("API expects pre-parsed domain names (e.g., 'example.com')");
+    info!("API supports domains (e.g., 'example.com') and IP addresses (e.g., '8.8.8.8')");
 
     // Graceful shutdown handling
     let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
-        info!("Received shutdown signal, gracefully shutting down...");
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                info!("Received shutdown signal, gracefully shutting down...");
+            }
+            Err(e) => {
+                warn!("Failed to install CTRL+C signal handler: {}", e);
+                warn!("Service will run without graceful shutdown capability");
+                // Block forever - service can still be killed with SIGKILL
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     axum::serve(listener, app)
@@ -226,79 +240,148 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Three-tier lookup: RDAP -> WHOIS -> (Command-line skipped for now)
+// Three-tier lookup: RDAP -> WHOIS
+// Auto-detects whether the query is a domain or IP address
 async fn three_tier_lookup(
     state: &AppState,
-    domain: &str,
+    query: &str,
 ) -> Result<LookupResult, WhoisError> {
-    // Tier 1: Try RDAP first (modern, structured JSON)
-    match state.rdap_service.lookup(domain).await {
-        Ok(rdap_result) => {
-            info!("✓ RDAP lookup successful for {}", domain);
-            return Ok(LookupResult {
-                server: format!("RDAP: {}", rdap_result.server),
-                raw_data: rdap_result.raw_data,
-                parsed_data: rdap_result.parsed_data,
-                parsing_analysis: rdap_result.parsing_analysis,
-            });
-        }
-        Err(e) => {
-            info!("⚠ RDAP lookup failed for {}: {} - falling back to WHOIS", domain, e);
-        }
-    }
+    use whois_service::DetectedQueryType;
 
-    // Tier 2: Fallback to WHOIS (legacy but comprehensive)
-    match state.whois_service.lookup(domain).await {
-        Ok(whois_result) => {
-            info!("✓ WHOIS lookup successful for {}", domain);
-            Ok(LookupResult {
-                server: format!("WHOIS: {}", whois_result.server),
-                raw_data: whois_result.raw_data,
-                parsed_data: whois_result.parsed_data,
-                parsing_analysis: whois_result.parsing_analysis,
-            })
+    // Auto-detect whether this is a domain or IP address
+    let validated = ValidatedQuery::new(query)?;
+
+    match validated.query_type() {
+        DetectedQueryType::Domain(_) => {
+            // Domain lookup: RDAP -> WHOIS fallback
+
+            // Tier 1: Try RDAP first (modern, structured JSON)
+            match state.rdap_service.lookup(query).await {
+                Ok(rdap_result) => {
+                    info!("✓ RDAP lookup successful for domain {}", query);
+                    return Ok(LookupResult {
+                        server: format!("RDAP: {}", rdap_result.server),
+                        raw_data: rdap_result.raw_data,
+                        parsed_data: rdap_result.parsed_data,
+                        parsing_analysis: rdap_result.parsing_analysis,
+                    });
+                }
+                Err(e) => {
+                    info!("⚠ RDAP lookup failed for domain {}: {} - falling back to WHOIS", query, e);
+                }
+            }
+
+            // Tier 2: Fallback to WHOIS (legacy but comprehensive)
+            match state.whois_service.lookup(query).await {
+                Ok(whois_result) => {
+                    info!("✓ WHOIS lookup successful for domain {}", query);
+                    Ok(LookupResult {
+                        server: format!("WHOIS: {}", whois_result.server),
+                        raw_data: whois_result.raw_data,
+                        parsed_data: whois_result.parsed_data,
+                        parsing_analysis: whois_result.parsing_analysis,
+                    })
+                }
+                Err(e) => {
+                    warn!("❌ Both RDAP and WHOIS lookups failed for domain {}", query);
+                    Err(e)
+                }
+            }
         }
-        Err(e) => {
-            warn!("❌ Both RDAP and WHOIS lookups failed for {}", domain);
-            Err(e)
+        DetectedQueryType::IpAddress(_) => {
+            // IP address lookup: RDAP -> WHOIS fallback
+
+            // Tier 1: Try RDAP first (RIR RDAP servers)
+            match state.rdap_service.lookup_ip(query).await {
+                Ok(rdap_result) => {
+                    info!("✓ RDAP lookup successful for IP {}", query);
+                    return Ok(LookupResult {
+                        server: format!("RDAP: {}", rdap_result.server),
+                        raw_data: rdap_result.raw_data,
+                        parsed_data: rdap_result.parsed_data,
+                        parsing_analysis: rdap_result.parsing_analysis,
+                    });
+                }
+                Err(e) => {
+                    info!("⚠ RDAP lookup failed for IP {}: {} - falling back to WHOIS", query, e);
+                }
+            }
+
+            // Tier 2: Fallback to WHOIS (RIR WHOIS servers)
+            match state.whois_service.lookup_ip(query).await {
+                Ok(whois_result) => {
+                    info!("✓ WHOIS lookup successful for IP {}", query);
+                    Ok(LookupResult {
+                        server: format!("WHOIS: {}", whois_result.server),
+                        raw_data: whois_result.raw_data,
+                        parsed_data: whois_result.parsed_data,
+                        parsing_analysis: whois_result.parsing_analysis,
+                    })
+                }
+                Err(e) => {
+                    warn!("❌ Both RDAP and WHOIS lookups failed for IP {}", query);
+                    Err(e)
+                }
+            }
         }
     }
 }
 
-/// Core lookup logic - takes pre-validated domain to avoid double validation
+/// Core lookup logic - handles both domains and IP addresses
 async fn perform_whois_lookup(
     state: &AppState,
-    domain: String,
+    query: String,
     fresh: bool,
     include_debug: bool,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
     let start_time = std::time::Instant::now();
-    
-    // Increment request counter
-    metrics::increment_requests(&domain);
 
-    // Check cache first (unless fresh is requested)
-    if !fresh {
-        if let Some(cached_result) = check_cache(&state.cache_service, &domain).await {
-            metrics::increment_cache_hits();
-            return Ok(Json(cached_result));
+    // Increment request counter
+    metrics::increment_requests(&query);
+
+    // For fresh or debug requests, bypass cache
+    if fresh || include_debug {
+        // Check rate limits (soft limits - log warnings but don't block)
+        if fresh && state.rate_limiter.check_fresh_query(&query) {
+            metrics::increment_errors("fresh_rate_limit_warning");
         }
+        if include_debug && state.rate_limiter.check_debug_query(&query) {
+            metrics::increment_errors("debug_rate_limit_warning");
+        }
+
+        let result = three_tier_lookup(state, &query).await?;
+        let query_time = start_time.elapsed().as_millis() as u64;
+        let response = build_whois_response(query.clone(), result, query_time, include_debug);
+
+        metrics::increment_cache_misses();
+        metrics::record_query_time(query_time);
+
+        return Ok(Json(response));
     }
 
-    // Perform three-tier lookup
-    let result = three_tier_lookup(state, &domain).await?;
-    
-    let query_time = start_time.elapsed().as_millis() as u64;
-    
-    let response = build_whois_response(domain.clone(), result, query_time, include_debug);
+    // Use cache with automatic query deduplication
+    // Multiple concurrent requests for same query will share the fetch operation
+    let response = state
+        .cache_service
+        .get_or_fetch(&query, || {
+            let state = state.clone();
+            let query = query.clone();
+            async move {
+                let result = three_tier_lookup(&state, &query).await?;
+                let query_time = start_time.elapsed().as_millis() as u64;
+                Ok(build_whois_response(query, result, query_time, false))
+            }
+        })
+        .await?;
 
-    // Cache the result (with error handling) - skip for debug requests
-    if !include_debug {
-        handle_cache_write(&state.cache_service, &domain, &response).await;
+    // Update metrics based on cache status
+    if response.cached {
+        metrics::increment_cache_hits();
+    } else {
         metrics::increment_cache_misses();
     }
-    
-    metrics::record_query_time(query_time);
+
+    metrics::record_query_time(response.query_time_ms);
 
     Ok(Json(response))
 }
@@ -309,7 +392,7 @@ async fn perform_whois_lookup(
     params(WhoisQuery),
     responses(
         (status = 200, description = "Whois lookup successful", body = WhoisResponse),
-        (status = 400, description = "Invalid domain"),
+        (status = 400, description = "Invalid domain or IP address"),
         (status = 500, description = "Internal server error")
     ),
     tag = "whois"
@@ -318,35 +401,19 @@ async fn whois_lookup(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = validate_domain_with_metrics(&params.domain)?;
+    let validated = validate_query_with_metrics(&params.domain)?;
     perform_whois_lookup(&state, validated.into_inner(), params.fresh, false).await
-}
-
-// Helper function to handle cache writes with timeout
-async fn handle_cache_write(cache_service: &CacheService, domain: &str, response: &WhoisResponse) {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(CACHE_WRITE_TIMEOUT_SECS),
-        cache_service.set(domain, response)
-    ).await {
-        Ok(()) => {
-            // Cache write successful
-        }
-        Err(_) => {
-            tracing::warn!("Cache write timeout for {}", domain);
-            metrics::increment_errors("cache_write_timeout");
-        }
-    }
 }
 
 // Helper function to build WhoisResponse - eliminates DRY violation
 fn build_whois_response(
-    domain: String,
+    query: String,
     result: LookupResult,
     query_time: u64,
     include_debug: bool,
 ) -> WhoisResponse {
     WhoisResponse {
-        domain,
+        domain: query,  // Field name is 'domain' for backward compatibility, but holds domain or IP
         whois_server: result.server,
         raw_data: result.raw_data,
         parsed_data: result.parsed_data,
@@ -369,7 +436,7 @@ async fn whois_lookup_post(
     params(WhoisQuery),
     responses(
         (status = 200, description = "Whois lookup with debug information", body = WhoisResponse),
-        (status = 400, description = "Invalid domain"),
+        (status = 400, description = "Invalid domain or IP address"),
         (status = 500, description = "Internal server error")
     ),
     tag = "whois"
@@ -378,7 +445,7 @@ async fn whois_debug(
     Query(params): Query<WhoisQuery>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = validate_domain_with_metrics(&params.domain)?;
+    let validated = validate_query_with_metrics(&params.domain)?;
     // Debug always uses fresh lookup (ignore params.fresh, always true)
     perform_whois_lookup(&state, validated.into_inner(), true, true).await
 }
@@ -388,12 +455,12 @@ async fn whois_debug(
     get,
     path = "/whois/{domain}",
     params(
-        ("domain" = String, Path, description = "Domain name to lookup", example = "google.com"),
+        ("domain" = String, Path, description = "Domain name or IP address to lookup", example = "google.com"),
         PathQueryParams
     ),
     responses(
         (status = 200, description = "Whois lookup successful", body = WhoisResponse),
-        (status = 400, description = "Invalid domain format"),
+        (status = 400, description = "Invalid domain or IP address format"),
         (status = 500, description = "Internal server error")
     ),
     tag = "whois"
@@ -403,7 +470,7 @@ async fn whois_lookup_path(
     Query(params): Query<PathQueryParams>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = validate_domain_with_metrics(&domain)?;
+    let validated = validate_query_with_metrics(&domain)?;
     perform_whois_lookup(&state, validated.into_inner(), params.fresh, false).await
 }
 
@@ -413,11 +480,11 @@ async fn whois_lookup_path(
     get,
     path = "/whois/debug/{domain}",
     params(
-        ("domain" = String, Path, description = "Domain name to lookup with debug info", example = "google.com")
+        ("domain" = String, Path, description = "Domain name or IP address to lookup with debug info", example = "google.com")
     ),
     responses(
         (status = 200, description = "Whois lookup with debug information", body = WhoisResponse),
-        (status = 400, description = "Invalid domain format"),
+        (status = 400, description = "Invalid domain or IP address format"),
         (status = 500, description = "Internal server error")
     ),
     tag = "whois"
@@ -426,7 +493,7 @@ async fn whois_debug_path(
     Path(domain): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let validated = validate_domain_with_metrics(&domain)?;
+    let validated = validate_query_with_metrics(&domain)?;
     // Debug always uses fresh lookup (cache bypass)
     perform_whois_lookup(&state, validated.into_inner(), true, true).await
 }
@@ -445,12 +512,6 @@ async fn health_check(State(state): State<AppState>) -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.start_time.elapsed().as_secs(),
     })
-}
-
-// Helper function to check cache
-async fn check_cache(cache_service: &CacheService, domain: &str) -> Option<WhoisResponse> {
-    // get() returns Option directly - cache operations are infallible
-    cache_service.get(domain).await
 }
 
 // Handle request timeout errors - matches WhoisError JSON format

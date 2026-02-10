@@ -1,4 +1,4 @@
-use crate::{ParsedWhoisData, dates};
+use crate::ParsedWhoisData;
 
 /// Stateless WHOIS response parser
 /// 
@@ -9,21 +9,7 @@ pub struct WhoisParser;
 impl WhoisParser {
     /// Parse raw WHOIS data into structured fields
     pub fn parse_whois_data(data: &str) -> ParsedWhoisData {
-        let mut parsed = ParsedWhoisData {
-            registrar: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            name_servers: Vec::new(),
-            status: Vec::new(),
-            registrant_name: None,
-            registrant_email: None,
-            admin_email: None,
-            tech_email: None,
-            created_ago: None,
-            updated_ago: None,
-            expires_in: None,
-        };
+        let mut parsed = ParsedWhoisData::new();
 
         for line in data.lines() {
             let line = line.trim();
@@ -115,14 +101,7 @@ impl WhoisParser {
         }
 
         // Calculate date-based fields using shared date utilities
-        let (created_ago, updated_ago, expires_in) = dates::calculate_date_fields(
-            &parsed.creation_date,
-            &parsed.updated_date,
-            &parsed.expiration_date,
-        );
-        parsed.created_ago = created_ago;
-        parsed.updated_ago = updated_ago;
-        parsed.expires_in = expires_in;
+        parsed.calculate_age_fields();
 
         parsed
     }
@@ -161,5 +140,113 @@ impl WhoisParser {
         }
         
         (parsed, analysis)
+    }
+
+    /// Parse IP WHOIS data with analysis
+    ///
+    /// IP WHOIS responses have different field names than domain WHOIS:
+    /// - NetRange, CIDR, NetName (network info)
+    /// - OrgName, OrgTechEmail (organization info)
+    /// - Updated, Created dates (no expiration for IPs)
+    pub fn parse_ip_whois_data_with_analysis(data: &str) -> (Option<ParsedWhoisData>, Vec<String>) {
+        let mut analysis = Vec::new();
+        analysis.push("=== IP WHOIS PARSING ANALYSIS ===".to_string());
+
+        // Use new() helper to eliminate boilerplate
+        let mut parsed = ParsedWhoisData::new();
+
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('%') || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some((key, value)) = line.split_once(':') {
+                let key = key.trim().to_lowercase();
+                let value = value.trim();
+
+                if value.is_empty() {
+                    continue;
+                }
+
+                // IP WHOIS-specific field matching
+                match key.as_str() {
+                    // Organization/Network name (use as "registrar" for consistency)
+                    "orgname" | "org-name" | "netname" | "owner" | "organization" => {
+                        if parsed.registrar.is_none() {
+                            parsed.registrar = Some(value.to_string());
+                            analysis.push(format!("✓ Organization: {}", value));
+                        }
+                    },
+
+                    // Dates
+                    "updated" | "lastupdated" | "changed" | "last-modified" => {
+                        if parsed.updated_date.is_none() {
+                            parsed.updated_date = Some(value.to_string());
+                            analysis.push(format!("✓ Updated Date: {}", value));
+                        }
+                    },
+                    "created" | "regdate" | "registration" => {
+                        if parsed.creation_date.is_none() {
+                            parsed.creation_date = Some(value.to_string());
+                            analysis.push(format!("✓ Created Date: {}", value));
+                        }
+                    },
+
+                    // Contact emails
+                    k if k.contains("orgtechemail") || k.contains("tech-c") || k.contains("technical") => {
+                        if parsed.tech_email.is_none() {
+                            parsed.tech_email = Some(value.to_string());
+                            analysis.push(format!("✓ Tech Email: {}", value));
+                        }
+                    },
+                    k if k.contains("orgabuseemail") || k.contains("abuse-c") || k.contains("abuse") => {
+                        if parsed.admin_email.is_none() {
+                            parsed.admin_email = Some(value.to_string());
+                            analysis.push(format!("✓ Abuse Email: {}", value));
+                        }
+                    },
+                    k if k.contains("orgemail") || k.contains("e-mail") || k.contains("email") => {
+                        if parsed.registrant_email.is_none() {
+                            parsed.registrant_email = Some(value.to_string());
+                            analysis.push(format!("✓ Contact Email: {}", value));
+                        }
+                    },
+
+                    // Status
+                    "status" | "nettype" => {
+                        if !parsed.status.contains(&value.to_string()) {
+                            parsed.status.push(value.to_string());
+                            analysis.push(format!("✓ Status: {}", value));
+                        }
+                    },
+
+                    // Network range info (log for analysis, not stored in ParsedWhoisData)
+                    "netrange" | "inetnum" | "cidr" => {
+                        analysis.push(format!("✓ Network Range: {}", value));
+                    },
+
+                    _ => {} // Ignore unrecognized fields
+                }
+            }
+        }
+
+        // Calculate date-based fields
+        parsed.calculate_age_fields();
+
+        // Summary analysis
+        analysis.push("\n=== SUMMARY ===".to_string());
+        analysis.push(format!("Organization: {}", parsed.registrar.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("Created: {}", parsed.creation_date.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("Updated: {}", parsed.updated_date.as_deref().unwrap_or("NOT FOUND")));
+        analysis.push(format!("Status entries: {}", parsed.status.len()));
+        analysis.push(format!("Contact emails found: {}",
+            [&parsed.registrant_email, &parsed.admin_email, &parsed.tech_email]
+                .iter()
+                .filter(|e| e.is_some())
+                .count()
+        ));
+
+        (Some(parsed), analysis)
     }
 } 

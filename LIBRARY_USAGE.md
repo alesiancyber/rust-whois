@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whois-service = "0.1.0"
+whois-service = "0.2.0"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -42,6 +42,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### IP Address Lookups (NEW in v0.2.0)
+
+```rust
+use whois_service::WhoisClient;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WhoisClient::new().await?;
+
+    // IPv4 lookup (auto-detected)
+    let ipv4_result = client.lookup("8.8.8.8").await?;
+    println!("IPv4 Server: {}", ipv4_result.whois_server);
+    if let Some(data) = ipv4_result.parsed_data {
+        println!("Network info: {:?}", data.registrar);
+    }
+
+    // IPv6 lookup (auto-detected)
+    let ipv6_result = client.lookup("2001:4860:4860::8888").await?;
+    println!("IPv6 Server: {}", ipv6_result.whois_server);
+
+    Ok(())
+}
+```
+
+### Auto-Detection (Domains vs IPs)
+
+```rust
+use whois_service::{WhoisClient, ValidatedQuery, DetectedQueryType};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = WhoisClient::new().await?;
+
+    // Auto-detection example
+    let queries = vec!["google.com", "8.8.8.8", "2001:4860:4860::8888"];
+
+    for query in queries {
+        // ValidatedQuery auto-detects the type
+        let validated = ValidatedQuery::new(query)?;
+
+        match validated.query_type() {
+            DetectedQueryType::Domain(_) => println!("{} is a domain", query),
+            DetectedQueryType::IpAddress(_) => println!("{} is an IP address", query),
+        }
+
+        // lookup() works for both
+        let result = client.lookup(query).await?;
+        println!("  Server: {}", result.whois_server);
+    }
+
+    Ok(())
+}
+```
+
 ### Error Handling
 
 ```rust
@@ -50,7 +104,7 @@ use whois_service::{WhoisClient, WhoisError};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = WhoisClient::new().await?;
-    
+
     match client.lookup("invalid-domain").await {
         Ok(result) => {
             println!("Success: {} ({}ms)", result.whois_server, result.query_time_ms);
@@ -58,8 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(WhoisError::InvalidDomain(domain)) => {
             println!("Invalid domain: {}", domain);
         }
+        Err(WhoisError::InvalidIpAddress(ip)) => {
+            println!("Invalid IP address: {}", ip);
+        }
         Err(WhoisError::UnsupportedTld(tld)) => {
             println!("Unsupported TLD: {}", tld);
+        }
+        Err(WhoisError::UnsupportedIpAddress(ip)) => {
+            println!("Unsupported IP address (private or reserved): {}", ip);
         }
         Err(WhoisError::Timeout) => {
             println!("Network timeout - try again later");
@@ -68,7 +128,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Other error: {}", e);
         }
     }
-    
+
     Ok(())
 }
 ```
@@ -83,17 +143,20 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Arc::new(Config {
-        whois_timeout_seconds: 30,
-        cache_ttl_seconds: 3600,
-        cache_max_entries: 10000,
-        concurrent_whois_queries: 8,
-        ..Default::default()
-    });
-    
+    // Config fields are private - use environment variables or Config::load()
+
+    // Option 1: Use environment variables
+    std::env::set_var("WHOIS_TIMEOUT_SECONDS", "30");
+    std::env::set_var("CACHE_TTL_SECONDS", "3600");
+    std::env::set_var("CACHE_MAX_ENTRIES", "10000");
+
+    let config = Arc::new(Config::load()?);
     let client = WhoisClient::new_with_config(config).await?;
+
+    // Option 2: Use default config (recommended)
+    let client = WhoisClient::new().await?;
     let result = client.lookup("example.com").await?;
-    
+
     println!("Result: {:?}", result.parsed_data);
     Ok(())
 }
@@ -321,10 +384,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### WhoisClient Methods
 
 - `WhoisClient::new()` - Create client with default configuration and caching
-- `WhoisClient::new_without_cache()` - Create client without caching  
+- `WhoisClient::new_without_cache()` - Create client without caching
 - `WhoisClient::new_with_config(config)` - Create client with custom configuration
-- `client.lookup(domain)` - Lookup domain (uses cache if available)
-- `client.lookup_fresh(domain)` - Lookup domain (always queries server)
+- `client.lookup(query)` - Lookup domain or IP (auto-detects, uses cache if available)
+- `client.lookup_fresh(query)` - Lookup domain or IP (auto-detects, always queries server)
 
 ### WhoisResponse Fields
 
@@ -343,30 +406,34 @@ pub struct WhoisResponse {
 
 ```rust
 pub struct ParsedWhoisData {
-    pub registrar: Option<String>,
-    pub creation_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub expiration_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub updated_date: Option<chrono::DateTime<chrono::Utc>>,
-    pub created_ago: Option<i64>,        // Days since creation
-    pub expires_in: Option<i64>,         // Days until expiration  
-    pub updated_ago: Option<i64>,        // Days since last update
-    pub name_servers: Vec<String>,
-    pub status: Vec<String>,
-    pub registrant_email: Option<String>,
+    pub registrar: Option<String>,              // Registrar name (or network name for IPs)
+    pub creation_date: Option<String>,          // ISO 8601 date string
+    pub expiration_date: Option<String>,        // ISO 8601 date string
+    pub updated_date: Option<String>,           // ISO 8601 date string
+    pub created_ago: Option<i64>,               // Days since creation
+    pub expires_in: Option<i64>,                // Days until expiration
+    pub updated_ago: Option<i64>,               // Days since last update
+    pub name_servers: Vec<String>,              // Name servers (domains only)
+    pub status: Vec<String>,                    // Domain/IP status codes
+    pub registrant_email: Option<String>,       // Contact emails
     pub admin_email: Option<String>,
     pub tech_email: Option<String>,
 }
 ```
 
+**Note**: For IP address lookups, `registrar` typically contains the network name or organization.
+
 ### Error Types
 
 ```rust
 pub enum WhoisError {
-    InvalidDomain(String),    // Domain validation failed
-    UnsupportedTld(String),   // TLD not supported
-    Timeout,                  // Network timeout
-    ResponseTooLarge,         // Response exceeded size limit
-    InvalidUtf8,              // Non-UTF8 response from server
+    InvalidDomain(String),        // Domain validation failed
+    InvalidIpAddress(String),     // IP address validation failed (NEW in v0.2.0)
+    UnsupportedTld(String),       // TLD not supported
+    UnsupportedIpAddress(String), // IP address not supported (private/reserved) (NEW in v0.2.0)
+    Timeout,                      // Network timeout
+    ResponseTooLarge,             // Response exceeded size limit
+    InvalidUtf8,                  // Non-UTF8 response from server
     IoError(tokio::io::Error),
     HttpError(reqwest::Error),
     RegexError(regex::Error),
@@ -379,16 +446,20 @@ pub enum WhoisError {
 
 1. **Reuse the client**: Create one `WhoisClient` and clone it for concurrent use
 2. **Enable caching**: Use `WhoisClient::new()` instead of `new_without_cache()` for better performance
-3. **Batch processing**: Use concurrent lookups for multiple domains
-4. **Error handling**: Always handle network timeouts and domain validation errors
+3. **Batch processing**: Use concurrent lookups for multiple domains and IPs
+4. **Error handling**: Always handle network timeouts, domain validation, and IP validation errors
 5. **Memory management**: The client handles buffer pooling automatically
+6. **Auto-detection**: Use `lookup()` for both domains and IPs - it auto-detects the type
+7. **IP support**: Private IPs (192.168.x.x, 10.x.x.x, 127.x.x.x, etc.) are rejected automatically
 
 ## 🏗 How It Works
 
-The library uses a three-tier lookup system:
+The library uses a three-tier lookup system for **both domains and IP addresses**:
 
-1. **RDAP First** - Modern structured JSON responses (faster, 1,188 TLD mappings)
+1. **RDAP First** - Modern structured JSON responses (faster, 1,194 TLD mappings + 5 RIRs)
 2. **WHOIS Fallback** - Traditional protocol for comprehensive coverage
 3. **Smart Caching** - In-memory cache for repeated lookups
+
+**Auto-Detection**: Pass any string to `lookup()` - it automatically detects whether it's a domain or IP address and routes to the appropriate service (RIR for IPs, TLD registry for domains).
 
 Your code stays simple - the library handles the complexity automatically! 

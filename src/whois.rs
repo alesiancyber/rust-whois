@@ -1,7 +1,6 @@
 use crate::{
-    config::Config, 
-    errors::WhoisError, 
-    ParsedWhoisData,
+    config::Config,
+    errors::WhoisError,
     tld_mappings::HARDCODED_TLD_SERVERS,
     buffer_pool::{BufferPool, PooledBuffer},
     parser::WhoisParser,
@@ -31,6 +30,10 @@ const MAX_DISCOVERY_TIMEOUT_SECS: u64 = 10;
 /// Prevents slow-loris attacks while allowing legitimate slow connections
 const TOTAL_TIMEOUT_MULTIPLIER: u64 = 2;
 
+/// Maximum retry attempts for transient failures
+/// Uses exponential backoff: immediate, +1s, +2s
+const MAX_RETRY_ATTEMPTS: usize = 3;
+
 /// Root WHOIS servers for TLD discovery (IANA is authoritative)
 const ROOT_WHOIS_SERVERS: &[&str] = &["whois.iana.org"];
 
@@ -42,12 +45,11 @@ pub struct WhoisService {
     buffer_pool: BufferPool,  // Reusable buffers for network I/O
 }
 
-pub struct WhoisResult {
-    pub server: String,
-    pub raw_data: String,
-    pub parsed_data: Option<ParsedWhoisData>,
-    pub parsing_analysis: Vec<String>,
-}
+/// Type alias for WHOIS lookup results
+///
+/// Uses the unified LookupResult structure to eliminate duplication
+/// with RDAP results. Maintains backward compatibility.
+pub type WhoisResult = crate::LookupResult;
 
 impl WhoisService {
     pub async fn new(config: Arc<Config>) -> Result<Self, WhoisError> {
@@ -56,7 +58,7 @@ impl WhoisService {
             tld_servers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             domain_query_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries)),
             discovery_semaphore: Arc::new(Semaphore::new(config.concurrent_whois_queries * 2)),
-            buffer_pool: Arc::new(tokio::sync::Mutex::new(Vec::with_capacity(config.buffer_pool_size))),
+            buffer_pool: Arc::new(crossbeam::queue::ArrayQueue::new(config.buffer_pool_size)),
         };
 
         info!("WhoisService initialized with hybrid TLD discovery (hardcoded + dynamic)");
@@ -67,21 +69,21 @@ impl WhoisService {
     }
 
     /// Perform whois lookup for a domain
-    /// Assumes domain is already validated by the API layer (ValidatedDomain)
+    /// Assumes domain is already validated and normalized by ValidatedDomain
     pub async fn lookup(&self, domain: &str) -> Result<WhoisResult, WhoisError> {
-        let domain = domain.trim().to_lowercase();
-        
+        // Domain is already normalized by ValidatedDomain - no need to lowercase again
+
         // Extract TLD from the domain using shared PSL-based extraction
-        let tld = extract_tld(&domain)?;
+        let tld = extract_tld(domain)?;
         
         // Find appropriate whois server (hybrid: hardcoded + dynamic discovery)
         let whois_server = self.find_whois_server(&tld).await?;
         
         // Perform whois query
-        let raw_data = self.raw_whois_query(&whois_server, &domain).await?;
-        
+        let raw_data = self.raw_whois_query(&whois_server, domain).await?;
+
         // Check for referrals and follow them
-        let (final_server, final_data) = self.follow_referrals(&whois_server, &raw_data, &domain).await?;
+        let (final_server, final_data) = self.follow_referrals(&whois_server, &raw_data, domain).await?;
         
         // Parse the whois data with detailed analysis
         let (parsed_data, parsing_analysis) = WhoisParser::parse_whois_data_with_analysis(&final_data);
@@ -90,6 +92,44 @@ impl WhoisService {
             server: final_server,
             raw_data: final_data,
             parsed_data: Some(parsed_data),
+            parsing_analysis,
+        })
+    }
+
+    /// Perform whois lookup for an IP address (IPv4 or IPv6)
+    ///
+    /// Assumes IP is already validated. Detects the appropriate RIR
+    /// (Regional Internet Registry) and queries their WHOIS server.
+    ///
+    /// # Arguments
+    ///
+    /// * `ip_addr` - Validated IP address string
+    ///
+    /// # Returns
+    ///
+    /// WhoisResult containing server info, raw data, and parsed fields
+    pub async fn lookup_ip(&self, ip_addr: &str) -> Result<WhoisResult, WhoisError> {
+        use crate::ip::{ValidatedIpAddress, detect_rir};
+
+        // Validate IP and detect RIR
+        let validated_ip = ValidatedIpAddress::new(ip_addr)?;
+        let rir = detect_rir(&validated_ip)?;
+
+        // Get WHOIS server for this RIR
+        let whois_server = rir.whois_server();
+
+        debug!("Using RIR whois server for IP {}: {} ({})", ip_addr, whois_server, format!("{:?}", rir));
+
+        // Perform whois query (IP queries typically don't need referral following)
+        let raw_data = self.raw_whois_query(whois_server, ip_addr).await?;
+
+        // Parse IP-specific whois data
+        let (parsed_data, parsing_analysis) = WhoisParser::parse_ip_whois_data_with_analysis(&raw_data);
+
+        Ok(WhoisResult {
+            server: whois_server.to_string(),
+            raw_data,
+            parsed_data,
             parsing_analysis,
         })
     }
@@ -112,10 +152,13 @@ impl WhoisService {
 
         // Dynamic discovery for uncommon/new TLDs
         if let Some(server) = self.discover_whois_server_dynamic(tld).await {
-            // Cache the discovered server
+            // Cache the discovered server using double-checked locking pattern
             {
                 let mut servers = self.tld_servers.write().await;
-                servers.insert(tld.to_string(), server.clone());
+                // Check again in case another thread just inserted it (avoids duplicate work)
+                if !servers.contains_key(tld) {
+                    servers.insert(tld.to_string(), server.clone());
+                }
             }
             return Ok(server);
         }
@@ -173,26 +216,35 @@ impl WhoisService {
     }
 
     async fn query_root_servers_for_tld(&self, tld: &str) -> Option<String> {
-        for root_server in Self::get_root_servers() {
-            debug!("Querying root server {} for TLD: {}", root_server, tld);
-            
-            match self.discovery_whois_query(root_server, tld).await {
-                Ok(response) => {
-                    debug!("Root server {} response length: {} bytes", root_server, response.len());
-                    
-                    if let Some(server) = Self::parse_root_server_response(&response) {
-                        return Some(server);
-                    }
-                    
-                    debug!("No referral found in response from {}", root_server);
-                }
-                Err(e) => {
-                    debug!("Failed to query root server {}: {}", root_server, e);
-                }
-            }
-        }
+        use futures::future::join_all;
 
-        None
+        // Query all root servers in parallel for faster discovery
+        let queries: Vec<_> = Self::get_root_servers()
+            .iter()
+            .map(|&root_server| {
+                let tld = tld.to_string();
+                async move {
+                    debug!("Querying root server {} for TLD: {}", root_server, tld);
+
+                    match self.discovery_whois_query(root_server, &tld).await {
+                        Ok(response) => {
+                            debug!("Root server {} response length: {} bytes", root_server, response.len());
+                            Self::parse_root_server_response(&response)
+                        }
+                        Err(e) => {
+                            debug!("Failed to query root server {}: {}", root_server, e);
+                            None
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        // Wait for all queries to complete in parallel
+        let results = join_all(queries).await;
+
+        // Return the first successful result
+        results.into_iter().find_map(|result| result)
     }
 
     fn parse_root_server_response(response: &str) -> Option<String> {
@@ -298,9 +350,23 @@ impl WhoisService {
     }
 
     async fn execute_whois_query(&self, server: &str, query: &str) -> Result<String, WhoisError> {
-        let mut stream = self.connect_to_whois_server(server).await?;
-        self.send_query(&mut stream, query).await?;
-        self.read_whois_response(&mut stream).await
+        use backon::{ExponentialBuilder, Retryable};
+
+        // Retry transient network errors with exponential backoff
+        // Max 3 attempts: immediate, +1s, +2s
+        let result = (|| async {
+            let mut stream = self.connect_to_whois_server(server).await?;
+            self.send_query(&mut stream, query).await?;
+            self.read_whois_response(&mut stream).await
+        })
+        .retry(&ExponentialBuilder::default().with_max_times(MAX_RETRY_ATTEMPTS))
+        .when(|e: &WhoisError| {
+            // Retry only on transient network errors
+            matches!(e, WhoisError::Timeout | WhoisError::IoError(_))
+        })
+        .await?;
+
+        Ok(result)
     }
 
     async fn connect_to_whois_server(&self, server: &str) -> Result<TcpStream, WhoisError> {
@@ -347,7 +413,7 @@ impl WhoisService {
             
             match timeout(
                 Duration::from_secs(self.config.whois_timeout_seconds),
-                stream.read(&mut *buffer)
+                stream.read(&mut buffer)
             ).await? {
                 Ok(0) => break, // EOF
                 Ok(n) => {
