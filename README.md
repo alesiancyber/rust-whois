@@ -39,7 +39,7 @@ curl "http://localhost:3000/health"
 
 ```toml
 [dependencies]
-whois-service = "0.2.0"
+whois-service = "0.2.1"
 ```
 
 ```rust

@@ -1,12 +1,13 @@
 [package]
 name = "whois-service"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "High-performance whois lookup service and library with dynamic TLD discovery"
+description = "High-performance WHOIS/RDAP lookup service and library for domains and IP addresses with auto-detection"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/alesiancyber/rust-whois"
-keywords = ["whois", "dns", "domain", "lookup", "async"]
+keywords = ["whois", "rdap", "domain", "ip", "lookup"]
 categories = ["network-programming", "web-programming"]
+readme = "README.md"
 
 # Library configuration
 [lib]

@@ -8,7 +8,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-whois-service = "0.2.0"
+whois-service = "0.2.1"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
