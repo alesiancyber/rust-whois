@@ -292,6 +292,7 @@ impl RdapService {
         // Use path_segments_mut for automatic URL encoding
         url.path_segments_mut()
             .map_err(|_| WhoisError::Internal("Cannot construct RDAP URL (base URL cannot be a base)".to_string()))?
+            .pop_if_empty()
             .push(resource_type)
             .push(query);
 
