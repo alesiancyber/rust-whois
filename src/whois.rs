@@ -441,19 +441,23 @@ impl WhoisService {
         while referral_count < max_referrals {
             if let Some(referral_server) = Self::extract_whois_server(&current_data) {
                 if referral_server != current_server {
-                    debug!("Following referral from {} to {}", current_server, referral_server);
+                    if self.test_whois_server(&referral_server).await {
+                        debug!("Following referral from {} to {}", current_server, referral_server);
                     
-                    match self.raw_whois_query(&referral_server, domain).await {
-                        Ok(new_data) => {
-                            current_server = referral_server;
-                            current_data = new_data;
-                            referral_count += 1;
-                            continue;
+                        match self.raw_whois_query(&referral_server, domain).await {
+                            Ok(new_data) => {
+                                current_server = referral_server;
+                                current_data = new_data;
+                                referral_count += 1;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!("Failed to query referral server {}: {}", referral_server, e);
+                                break;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Failed to query referral server {}: {}", referral_server, e);
-                            break;
-                        }
+                    } else {
+                        warn!("Referral server liveness test failed. Skipping {}", referral_server);
                     }
                 }
             }
