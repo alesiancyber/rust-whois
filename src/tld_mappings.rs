@@ -90,7 +90,7 @@ pub static HARDCODED_TLD_SERVERS: Lazy<HashMap<&'static str, &'static str>> = La
     map.insert("com.br", "whois.registro.br");
     map.insert("ar", "whois.nic.ar");
     map.insert("cl", "whois.nic.cl");
-    map.insert("co", "whois.nic.co");
+    map.insert("co", "whois.registry.co");
     map.insert("pe", "kero.yachay.pe");
     map.insert("uy", "whois.nic.org.uy");
     map.insert("ve", "whois.nic.ve");
