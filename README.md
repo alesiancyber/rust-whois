@@ -5,9 +5,11 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 ## Overview
 
 - **RDAP-first** with automatic WHOIS fallback for universal coverage
-- **Dynamic TLD discovery** from live IANA data (RDAP bootstrap + root WHOIS referrals) with a self-healing runtime cache - no hardcoded server lists to go stale
+- **Dynamic TLD discovery** from live IANA data (RDAP bootstrap + root WHOIS referrals), refreshed daily with a self-healing runtime cache - no hardcoded server lists to go stale
 - **Domain and IP address lookups** (IPv4 and IPv6)
-- **Intelligent caching** with configurable TTL (avoids rate limiting)
+- **Lookup outcome classification**: every response reports `found`, `not_found`, or `rate_limited` - no more parsing raw text to tell a record from an NXDOMAIN or a throttle banner
+- **Rate-limit-aware caching**: found records cache for the full TTL, NXDOMAIN gets a short negative TTL, and upstream throttle responses are never cached
+- **Shared Redis cache tier** (optional `redis-cache` feature): a fleet of instances presents one cache to upstream registries, so query volume stays flat as you scale out
 - **Calculated fields** for threat detection: `created_ago`, `updated_ago`, `expires_in`
 - **Dual-use**: Import as a Rust library or run as an HTTP API
 
@@ -39,7 +41,7 @@ curl "http://localhost:3000/health"
 
 ```toml
 [dependencies]
-whois-service = "0.2.1"
+whois-service = "0.3.0"
 ```
 
 ```rust
@@ -117,12 +119,15 @@ curl "http://localhost:3000/whois?domain=8.8.8.8"
     "expires_in": 961,
     "updated_ago": 45
   },
+  "lookup_status": "found",
   "cached": false,
   "query_time_ms": 450
 }
 ```
 
-**Note**: The `domain` field contains either a domain name OR an IP address. For IP lookups, the `parsed_data.registrar` field often contains the network name or organization.
+**Notes**:
+- The `domain` field contains either a domain name OR an IP address. For IP lookups, the `parsed_data.registrar` field often contains the network name or organization.
+- `lookup_status` is `"found"`, `"not_found"` (the domain/IP is not registered - still HTTP 200), or `"rate_limited"` (the upstream server throttled the query; treat the data as unreliable and retry later).
 
 ## Performance
 
@@ -140,10 +145,12 @@ Key environment variables:
 
 ```bash
 PORT=3000                      # HTTP port
-CACHE_TTL_SECONDS=3600         # Cache TTL (1 hour default)
+CACHE_TTL_SECONDS=3600         # Cache TTL for found records (1 hour default)
+NEGATIVE_CACHE_TTL_SECONDS=300 # Cache TTL for not-found lookups (0 disables)
 CACHE_MAX_ENTRIES=10000        # Max cached domains
 WHOIS_TIMEOUT_SECONDS=30       # Query timeout
 CONCURRENT_WHOIS_QUERIES=8     # Parallel query limit
+REDIS_URL=redis://host:6379    # Shared cache tier (requires redis-cache feature)
 RUST_LOG=whois_service=info    # Log level
 ```
 
@@ -160,8 +167,11 @@ cargo build --release
 
 # Library only (no HTTP server)
 cargo build --no-default-features
+
+# With shared Redis cache tier
+cargo build --release --features redis-cache
 ```
 
 ## License
 
-MIT
+MIT OR Apache-2.0
