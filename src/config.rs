@@ -9,6 +9,11 @@ pub struct Config {
     pub whois_timeout_seconds: u64,
     pub max_response_size: usize,
     pub cache_ttl_seconds: u64,
+    /// TTL for negative (not-found) cache entries. Shorter than the positive
+    /// TTL so newly registered domains are noticed quickly, but long enough to
+    /// absorb repeated lookups of nonexistent domains (common in security
+    /// pipelines). Rate-limited responses are never cached at all.
+    pub negative_cache_ttl_seconds: u64,
     pub cache_max_entries: u64,
     pub max_referrals: usize,
     pub discovery_timeout_seconds: u64,
@@ -29,6 +34,7 @@ impl Config {
             .set_default("whois_timeout_seconds", system_info.default_timeout)?
             .set_default("max_response_size", system_info.max_response_size as i64)?
             .set_default("cache_ttl_seconds", system_info.cache_ttl)?
+            .set_default("negative_cache_ttl_seconds", 300)?
             .set_default("cache_max_entries", system_info.cache_max_entries)?
             .set_default("max_referrals", system_info.max_referrals as i64)?
             .set_default("discovery_timeout_seconds", system_info.discovery_timeout)?
@@ -47,8 +53,12 @@ impl Config {
         Ok(config)
     }
 
-    /// Validate configuration values to catch invalid settings early
-    fn validate(&self) -> Result<(), config::ConfigError> {
+    /// Validate configuration values to catch invalid settings early.
+    ///
+    /// Called automatically by `load()`, and again by service constructors so
+    /// hand-built `Config` values (all fields are public) can't slip through
+    /// with zeros that would panic the buffer pool or deadlock the semaphores.
+    pub fn validate(&self) -> Result<(), config::ConfigError> {
         if self.port == 0 {
             return Err(config::ConfigError::Message("port cannot be 0".into()));
         }
@@ -129,9 +139,20 @@ impl Config {
     }
 
     fn is_production_environment() -> bool {
-        std::env::var("ENVIRONMENT")
+        let value = std::env::var("ENVIRONMENT")
             .or_else(|_| std::env::var("ENV"))
-            .map(|env| env.to_lowercase() == "production" || env.to_lowercase() == "prod")
+            .ok();
+        Self::is_production_value(value.as_deref())
+    }
+
+    /// Pure classification of an environment string (testable without
+    /// mutating process-global env vars, which races with parallel tests)
+    fn is_production_value(value: Option<&str>) -> bool {
+        value
+            .map(|env| {
+                let env = env.to_lowercase();
+                env == "production" || env == "prod"
+            })
             .unwrap_or(false)
     }
 
@@ -193,6 +214,8 @@ impl Config {
             ("MAX_RESPONSE_SIZE", "max_response_size"),
             ("CACHE_TTL_SECONDS", "cache_ttl_seconds"),
             ("CACHE_TTL", "cache_ttl_seconds"),
+            ("NEGATIVE_CACHE_TTL_SECONDS", "negative_cache_ttl_seconds"),
+            ("NEGATIVE_CACHE_TTL", "negative_cache_ttl_seconds"),
             ("CACHE_MAX_ENTRIES", "cache_max_entries"),
             ("CACHE_SIZE", "cache_max_entries"),
             ("MAX_REFERRALS", "max_referrals"),
@@ -367,41 +390,20 @@ mod tests {
     }
 
     #[test]
-    fn test_is_production_environment() {
-        // Save original env vars
-        let original_env = std::env::var("ENVIRONMENT").ok();
-        let original_env2 = std::env::var("ENV").ok();
+    fn test_is_production_value() {
+        // Production values (case-insensitive)
+        assert!(Config::is_production_value(Some("production")));
+        assert!(Config::is_production_value(Some("prod")));
+        assert!(Config::is_production_value(Some("PRODUCTION")));
+        assert!(Config::is_production_value(Some("Prod")));
 
-        // Test production
-        std::env::set_var("ENVIRONMENT", "production");
-        assert!(Config::is_production_environment());
+        // Non-production values
+        assert!(!Config::is_production_value(Some("development")));
+        assert!(!Config::is_production_value(Some("dev")));
+        assert!(!Config::is_production_value(Some("staging")));
+        assert!(!Config::is_production_value(Some("")));
 
-        std::env::set_var("ENVIRONMENT", "prod");
-        assert!(Config::is_production_environment());
-
-        std::env::set_var("ENVIRONMENT", "PRODUCTION");
-        assert!(Config::is_production_environment());
-
-        // Test non-production
-        std::env::set_var("ENVIRONMENT", "development");
-        assert!(!Config::is_production_environment());
-
-        std::env::set_var("ENVIRONMENT", "dev");
-        assert!(!Config::is_production_environment());
-
-        std::env::remove_var("ENVIRONMENT");
-        assert!(!Config::is_production_environment());
-
-        // Restore original env vars
-        if let Some(val) = original_env {
-            std::env::set_var("ENVIRONMENT", val);
-        } else {
-            std::env::remove_var("ENVIRONMENT");
-        }
-        if let Some(val) = original_env2 {
-            std::env::set_var("ENV", val);
-        } else {
-            std::env::remove_var("ENV");
-        }
+        // Unset
+        assert!(!Config::is_production_value(None));
     }
 } 

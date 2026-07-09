@@ -51,10 +51,9 @@ impl ValidatedIpAddress {
         let ip_str = ip.into().trim().to_string();
 
         // Parse using std::net::IpAddr (handles both IPv4 and IPv6)
+        // (variant Display already prefixes "Invalid IP address:")
         let addr: IpAddr = ip_str.parse()
-            .map_err(|_| WhoisError::InvalidIpAddress(
-                format!("Invalid IP address: {}", ip_str)
-            ))?;
+            .map_err(|_| WhoisError::InvalidIpAddress(ip_str.clone()))?;
 
         // Normalize to canonical form
         let normalized = addr.to_string();
@@ -384,8 +383,8 @@ impl RirDatabase {
         ];
 
         let ipv6_ranges = vec![
-            // ARIN IPv6 allocations
-            (ipv6_range("2001:400::", "2001:7ff:ffff:ffff:ffff:ffff:ffff:ffff"), Rir::ARIN),
+            // ARIN IPv6 allocations (2001:400::/23 - must not overlap RIPE's 2001:600::/23)
+            (ipv6_range("2001:400::", "2001:5ff:ffff:ffff:ffff:ffff:ffff:ffff"), Rir::ARIN),
             (ipv6_range("2600::", "26ff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Rir::ARIN),
             (ipv6_range("2610::", "261f:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Rir::ARIN),
             (ipv6_range("2620::", "262f:ffff:ffff:ffff:ffff:ffff:ffff:ffff"), Rir::ARIN),
@@ -448,12 +447,16 @@ impl RirDatabase {
 /// This function determines which of the five RIRs (ARIN, RIPE, APNIC, LACNIC, AFRINIC)
 /// is responsible for the given IP address based on allocation data.
 ///
+/// The local allocation table covers major ranges only. Public IPs not found in the
+/// table fall back to ARIN: ARIN's RDAP server redirects to the authoritative RIR
+/// (HTTP 3xx, followed automatically) and its WHOIS server returns a `ReferralServer`
+/// line that the WHOIS client follows.
+///
 /// # Errors
 ///
 /// Returns `WhoisError::UnsupportedIpAddress` if:
 /// - The IP is in a private range (RFC 1918, RFC 4193)
-/// - The IP is in a special-use range (loopback, link-local, etc.)
-/// - The IP is not allocated to any known RIR
+/// - The IP is in a special-use range (loopback, link-local, reserved, etc.)
 ///
 /// # Examples
 ///
@@ -477,15 +480,22 @@ pub fn detect_rir(ip: &ValidatedIpAddress) -> Result<Rir, WhoisError> {
         ));
     }
 
-    // Look up in RIR database
-    RIR_DB.detect_rir(ip.addr())
-        .ok_or_else(|| WhoisError::UnsupportedIpAddress(
-            format!("Could not determine RIR for IP: {}", ip.as_str())
-        ))
+    // Look up in RIR database; unknown public IPs default to ARIN,
+    // which redirects/refers to the authoritative RIR
+    match RIR_DB.detect_rir(ip.addr()) {
+        Some(rir) => Ok(rir),
+        None => {
+            debug!(
+                "IP {} not in local RIR table, defaulting to ARIN (redirects to authoritative RIR)",
+                ip.as_str()
+            );
+            Ok(Rir::ARIN)
+        }
+    }
 }
 
 /// Check if an IP address is in a private or special-use range
-fn is_private_or_special(ip: &IpAddr) -> bool {
+pub(crate) fn is_private_or_special(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
             // RFC 1918 private ranges
@@ -503,7 +513,11 @@ fn is_private_or_special(ip: &IpAddr) -> bool {
             // Unspecified
             ipv4.is_unspecified() ||
             // Shared address space (RFC 6598) - 100.64.0.0/10
-            (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64)
+            (ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64) ||
+            // Reserved (RFC 1112) - 240.0.0.0/4
+            ipv4.octets()[0] >= 240 ||
+            // Benchmarking (RFC 2544) - 198.18.0.0/15
+            (ipv4.octets()[0] == 198 && (ipv4.octets()[1] & 0xFE) == 18)
         }
         IpAddr::V6(ipv6) => {
             // RFC 4193 unique local addresses

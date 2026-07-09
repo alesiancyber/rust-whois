@@ -4,7 +4,7 @@
 //! 
 //! ## Features
 //! 
-//! - Hybrid TLD discovery: hardcoded mappings for popular TLDs + dynamic discovery
+//! - Dynamic TLD discovery: IANA root/bootstrap data with a self-healing runtime cache
 //! - Intelligent whois server detection with fallback strategies
 //! - Structured data parsing with calculated fields (age, expiration)
 //! - Optional caching with smart domain normalization
@@ -33,19 +33,22 @@ pub mod rdap;
 pub mod cache;
 pub mod config;
 pub mod errors;
-pub mod tld_mappings;
 pub mod buffer_pool;
 pub mod parser;
 pub mod tld;
 pub mod dates;
 pub mod rate_limiter;
 pub mod ip;
+#[cfg(feature = "redis-cache")]
+pub mod redis_cache;
 
 
 // Re-export main types for easy access
 pub use whois::{WhoisService, WhoisResult};
 pub use rdap::{RdapService, RdapResult};
-pub use cache::CacheService;
+pub use cache::{CacheService, CacheBackend, BackendError};
+#[cfg(feature = "redis-cache")]
+pub use redis_cache::RedisCache;
 pub use config::Config;
 pub use errors::WhoisError;
 pub use tld::extract_tld;
@@ -77,7 +80,9 @@ impl ValidatedDomain {
         use addr::parser::DnsName;
         use addr::psl::List;
 
-        let domain = domain.into().trim().to_lowercase();
+        // Normalize: trim, lowercase, and drop the trailing root dot ("example.com.")
+        // so downstream TLD extraction and server caches see one canonical form
+        let domain = domain.into().trim().trim_end_matches('.').to_lowercase();
 
         // Check for empty domain
         if domain.is_empty() {
@@ -89,10 +94,19 @@ impl ValidatedDomain {
             return Err(WhoisError::InvalidDomain("Domain must contain at least one dot".to_string()));
         }
 
+        // Reject URL-ish syntax explicitly. The addr crate parses DNS *names*,
+        // which permit almost any byte in a label, so "http://example.com"
+        // would otherwise validate and be sent verbatim to WHOIS servers.
+        if domain.contains(['/', ':', '?', '#', '@', ' ']) {
+            return Err(WhoisError::InvalidDomain(format!(
+                "Domain contains URL syntax or invalid characters: {} (pass a bare hostname)", domain
+            )));
+        }
+
         // Use addr crate for comprehensive validation
         // This handles RFC 1035/5891, IDNA, punycode, and PSL validation
         List.parse_dns_name(&domain)
-            .map_err(|e| WhoisError::InvalidDomain(format!("Invalid domain: {}", e)))?;
+            .map_err(|e| WhoisError::InvalidDomain(format!("{} ({})", domain, e)))?;
 
         Ok(ValidatedDomain(domain))
     }
@@ -157,7 +171,6 @@ pub enum DetectedQueryType {
 #[derive(Debug, Clone)]
 pub struct ValidatedQuery {
     query_type: DetectedQueryType,
-    original: String,
 }
 
 impl ValidatedQuery {
@@ -172,21 +185,29 @@ impl ValidatedQuery {
     pub fn new(input: impl Into<String>) -> Result<Self, WhoisError> {
         let input = input.into();
         let trimmed = input.trim();
-        let original = input.clone();
 
         // Try IP address first (faster to validate)
         if let Ok(ip) = ValidatedIpAddress::new(trimmed) {
             return Ok(Self {
                 query_type: DetectedQueryType::IpAddress(ip),
-                original,
             });
+        }
+
+        // Inputs that look like IP addresses but failed to parse (e.g.
+        // "300.300.300.300", "2001:db8::12345") should surface an invalid-IP
+        // error instead of falling through to a confusing domain/TLD failure
+        let looks_like_ipv4 = trimmed.contains('.')
+            && trimmed.chars().all(|c| c.is_ascii_digit() || c == '.');
+        let looks_like_ipv6 = trimmed.contains(':')
+            && trimmed.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        if looks_like_ipv4 || looks_like_ipv6 {
+            return Err(WhoisError::InvalidIpAddress(trimmed.to_string()));
         }
 
         // Fall back to domain validation
         let domain = ValidatedDomain::new(trimmed)?;
         Ok(Self {
             query_type: DetectedQueryType::Domain(domain),
-            original,
         })
     }
 
@@ -234,8 +255,27 @@ impl std::fmt::Display for ValidatedQuery {
     }
 }
 
+/// Outcome classification of a lookup response
+///
+/// WHOIS servers signal "domain does not exist" and "you are being throttled"
+/// as ordinary response text, and RDAP signals them as HTTP 404/429. This enum
+/// surfaces that outcome as structured data so callers (and the cache) don't
+/// treat throttle banners or NXDOMAIN responses as real registration records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum LookupStatus {
+    /// A registration record was returned
+    #[default]
+    Found,
+    /// The queried object is not registered / does not exist
+    NotFound,
+    /// The upstream server refused the query due to rate limiting or quota
+    RateLimited,
+}
+
 /// Parsed whois data structure with calculated fields
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ParsedWhoisData {
     /// Domain registrar name
@@ -293,20 +333,32 @@ impl ParsedWhoisData {
     /// This eliminates the boilerplate of manually initializing all 13 fields
     /// in every parser function.
     pub fn new() -> Self {
-        Self {
-            registrar: None,
-            creation_date: None,
-            expiration_date: None,
-            updated_date: None,
-            name_servers: Vec::new(),
-            status: Vec::new(),
-            registrant_name: None,
-            registrant_email: None,
-            admin_email: None,
-            tech_email: None,
-            created_ago: None,
-            updated_ago: None,
-            expires_in: None,
+        Self::default()
+    }
+
+    /// Fill any empty fields from another parse result.
+    ///
+    /// Used when a registrar referral response turns out thinner than the
+    /// registry response already in hand (rate-limited or empty registrar
+    /// WHOIS servers are common) - referral data wins, registry data fills gaps.
+    pub fn fill_missing_from(&mut self, fallback: &ParsedWhoisData) {
+        macro_rules! fill_option {
+            ($($field:ident),+) => {
+                $(if self.$field.is_none() {
+                    self.$field = fallback.$field.clone();
+                })+
+            };
+        }
+        fill_option!(
+            registrar, creation_date, expiration_date, updated_date,
+            registrant_name, registrant_email, admin_email, tech_email,
+            created_ago, updated_ago, expires_in
+        );
+        if self.name_servers.is_empty() {
+            self.name_servers = fallback.name_servers.clone();
+        }
+        if self.status.is_empty() {
+            self.status = fallback.status.clone();
         }
     }
 
@@ -340,13 +392,29 @@ pub struct LookupResult {
     pub parsed_data: Option<ParsedWhoisData>,
     /// Parsing analysis and debug information
     pub parsing_analysis: Vec<String>,
+    /// Classified outcome (found / not found / rate limited)
+    pub status: LookupStatus,
 }
 
-/// High-level whois client with optional caching
+/// High-level lookup client with optional caching
+///
+/// Uses a three-tier lookup strategy for both domains and IP addresses:
+/// 1. RDAP first (modern, structured JSON)
+/// 2. WHOIS fallback (legacy but comprehensive)
+/// 3. Optional in-memory caching with request deduplication
 #[derive(Clone)]
 pub struct WhoisClient {
     service: Arc<WhoisService>,
+    rdap: Arc<RdapService>,
     cache: Option<Arc<CacheService>>,
+}
+
+/// Cache configuration for `WhoisClient::build`
+enum CacheMode {
+    /// In-process moka cache only (or disabled entirely)
+    InProcess { enabled: bool },
+    /// In-process cache backed by a shared second tier (e.g. Redis)
+    Tiered(Arc<dyn cache::CacheBackend>),
 }
 
 impl WhoisClient {
@@ -360,23 +428,38 @@ impl WhoisClient {
 
     /// Create a new whois client with custom configuration
     pub async fn new_with_config(config: Arc<Config>) -> Result<Self, WhoisError> {
-        let service = Arc::new(WhoisService::new(config.clone()).await?);
-        let cache = Self::initialize_cache(config);
-        
-        Ok(Self { service, cache })
+        Self::build(config, CacheMode::InProcess { enabled: true }).await
     }
 
     /// Create a new whois client without caching
     pub async fn new_without_cache() -> Result<Self, WhoisError> {
-        let config = Self::load_default_config()?;
-        let service = Arc::new(WhoisService::new(config).await?);
-        
-        Ok(Self { service, cache: None })
+        Self::build(Self::load_default_config()?, CacheMode::InProcess { enabled: false }).await
     }
 
-    /// Initialize cache
-    fn initialize_cache(config: Arc<Config>) -> Option<Arc<CacheService>> {
-        Some(Arc::new(CacheService::new(config)))
+    /// Create a client whose cache has a shared second tier (e.g. Redis).
+    ///
+    /// The in-process cache still provides fast hits and request coalescing;
+    /// the backend is consulted on local misses and written through on
+    /// fetches, so every instance sharing it shares one cache - upstream
+    /// query volume stays flat as instances scale out.
+    pub async fn new_with_cache_backend(
+        config: Arc<Config>,
+        backend: Arc<dyn cache::CacheBackend>,
+    ) -> Result<Self, WhoisError> {
+        Self::build(config, CacheMode::Tiered(backend)).await
+    }
+
+    /// Shared constructor for all client variants
+    async fn build(config: Arc<Config>, cache_mode: CacheMode) -> Result<Self, WhoisError> {
+        let service = Arc::new(WhoisService::new(config.clone()).await?);
+        let rdap = Arc::new(RdapService::new(config.clone()).await?);
+        let cache = match cache_mode {
+            CacheMode::InProcess { enabled: false } => None,
+            CacheMode::InProcess { enabled: true } => Some(Arc::new(CacheService::new(config))),
+            CacheMode::Tiered(backend) => Some(Arc::new(CacheService::with_backend(config, backend))),
+        };
+
+        Ok(Self { service, rdap, cache })
     }
 
     // === Public API Methods ===
@@ -419,20 +502,68 @@ impl WhoisClient {
     pub async fn lookup_with_options(&self, query: &str, fresh: bool) -> Result<WhoisResponse, WhoisError> {
         let start_time = std::time::Instant::now();
 
-        // Auto-detect query type (domain or IP)
+        // Auto-detect query type (domain or IP) and normalize
         let validated = ValidatedQuery::new(query)?;
+        let is_ip = validated.is_ip();
+        let query = validated.into_inner();
 
-        // Check type before moving validated
-        let is_domain = validated.is_domain();
-        let query_str = validated.as_str().to_string();
-        let original = validated.into_inner();
+        self.lookup_internal(&query, is_ip, fresh, start_time).await
+    }
 
-        // Dispatch based on query type
-        if is_domain {
-            self.lookup_domain_internal(&query_str, fresh, start_time, original).await
+    /// Perform an RDAP-first lookup with WHOIS fallback
+    ///
+    /// The returned server is prefixed with "RDAP: " or "WHOIS: " so callers
+    /// can tell which protocol answered.
+    async fn lookup_with_fallback(&self, query: &str, is_ip: bool) -> Result<LookupResult, WhoisError> {
+        // Tier 1: RDAP (modern, structured JSON)
+        let rdap_result = if is_ip {
+            self.rdap.lookup_ip(query).await
         } else {
-            self.lookup_ip_internal(&query_str, fresh, start_time, original).await
+            self.rdap.lookup(query).await
+        };
+
+        match rdap_result {
+            // An Ok(NotFound) short-circuits here too: the registry's RDAP 404
+            // is authoritative, so a WHOIS fallback query would be wasted load
+            Ok(mut result) => {
+                result.server = format!("RDAP: {}", result.server);
+                return Ok(result);
+            }
+            Err(e) => {
+                tracing::debug!("RDAP lookup failed for {}: {} - falling back to WHOIS", query, e);
+            }
         }
+
+        // Tier 2: WHOIS (legacy but comprehensive)
+        let mut result = if is_ip {
+            self.service.lookup_ip(query).await?
+        } else {
+            self.service.lookup(query).await?
+        };
+        result.server = format!("WHOIS: {}", result.server);
+        Ok(result)
+    }
+
+    /// Perform a lookup and package it as a WhoisResponse
+    async fn fetch_response(
+        &self,
+        query: &str,
+        is_ip: bool,
+        start_time: std::time::Instant,
+    ) -> Result<WhoisResponse, WhoisError> {
+        let result = self.lookup_with_fallback(query, is_ip).await?;
+        let query_time = start_time.elapsed().as_millis() as u64;
+
+        Ok(WhoisResponse {
+            domain: query.to_string(),
+            whois_server: result.server,
+            raw_data: result.raw_data,
+            parsed_data: result.parsed_data,
+            lookup_status: result.status,
+            cached: false,
+            query_time_ms: query_time,
+            parsing_analysis: Some(result.parsing_analysis),
+        })
     }
 
     /// Generic internal lookup implementation for both domains and IPs
@@ -445,98 +576,33 @@ impl WhoisClient {
         is_ip: bool,
         fresh: bool,
         start_time: std::time::Instant,
-        original: String,
     ) -> Result<WhoisResponse, WhoisError> {
         // If fresh lookup requested, bypass cache
         if fresh {
-            let result = if is_ip {
-                self.service.lookup_ip(query).await?
-            } else {
-                self.service.lookup(query).await?
-            };
-            let query_time = start_time.elapsed().as_millis() as u64;
-
-            return Ok(WhoisResponse {
-                domain: original,
-                whois_server: result.server,
-                raw_data: result.raw_data,
-                parsed_data: result.parsed_data,
-                cached: false,
-                query_time_ms: query_time,
-                parsing_analysis: None,
-            });
+            return self.fetch_response(query, is_ip, start_time).await;
         }
 
         // Use cache with automatic query deduplication if available
         if let Some(cache) = &self.cache {
             let query_owned = query.to_string();
-            let service = self.service.clone();
+            let client = self.clone();
 
             let mut response = cache
                 .get_or_fetch(query, || async move {
-                    let result = if is_ip {
-                        service.lookup_ip(&query_owned).await?
-                    } else {
-                        service.lookup(&query_owned).await?
-                    };
-                    let query_time = start_time.elapsed().as_millis() as u64;
-
-                    Ok(WhoisResponse {
-                        domain: query_owned.clone(),
-                        whois_server: result.server,
-                        raw_data: result.raw_data,
-                        parsed_data: result.parsed_data,
-                        cached: false,
-                        query_time_ms: query_time,
-                        parsing_analysis: None,
-                    })
+                    client.fetch_response(&query_owned, is_ip, start_time).await
                 })
                 .await?;
 
-            // Restore original input format (preserves user's input case/whitespace)
-            response.domain = original;
+            // A cache hit stores the original fetch's duration - report this
+            // request's actual (near-instant) latency instead
+            if response.cached {
+                response.query_time_ms = start_time.elapsed().as_millis() as u64;
+            }
             Ok(response)
         } else {
             // No cache - perform direct lookup
-            let result = if is_ip {
-                self.service.lookup_ip(query).await?
-            } else {
-                self.service.lookup(query).await?
-            };
-            let query_time = start_time.elapsed().as_millis() as u64;
-
-            Ok(WhoisResponse {
-                domain: original,
-                whois_server: result.server,
-                raw_data: result.raw_data,
-                parsed_data: result.parsed_data,
-                cached: false,
-                query_time_ms: query_time,
-                parsing_analysis: None,
-            })
+            self.fetch_response(query, is_ip, start_time).await
         }
-    }
-
-    /// Internal domain lookup implementation
-    async fn lookup_domain_internal(
-        &self,
-        domain: &str,
-        fresh: bool,
-        start_time: std::time::Instant,
-        original: String,
-    ) -> Result<WhoisResponse, WhoisError> {
-        self.lookup_internal(domain, false, fresh, start_time, original).await
-    }
-
-    /// Internal IP lookup implementation
-    async fn lookup_ip_internal(
-        &self,
-        ip_addr: &str,
-        fresh: bool,
-        start_time: std::time::Instant,
-        original: String,
-    ) -> Result<WhoisResponse, WhoisError> {
-        self.lookup_internal(ip_addr, true, fresh, start_time, original).await
     }
 
 
@@ -564,6 +630,10 @@ pub struct WhoisResponse {
     pub whois_server: String,
     pub raw_data: String,
     pub parsed_data: Option<ParsedWhoisData>,
+    /// Classified outcome: "found", "not_found" (domain is not registered),
+    /// or "rate_limited" (upstream throttled the query - data is unreliable)
+    #[serde(default)]
+    pub lookup_status: LookupStatus,
     pub cached: bool,
     pub query_time_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -629,6 +699,12 @@ mod tests {
         // Invalid dot patterns (checked before addr validation)
         assert!(ValidatedDomain::new("example..com").is_err());
 
+        // URL syntax must be rejected (addr's DNS-name parsing would accept it)
+        assert!(ValidatedDomain::new("http://example.com").is_err());
+        assert!(ValidatedDomain::new("example.com/path").is_err());
+        assert!(ValidatedDomain::new("example.com:443").is_err());
+        assert!(ValidatedDomain::new("user@example.com").is_err());
+
         // Note: addr library may accept some edge cases by normalizing them
         // It relies on PSL and DNS RFCs for validation
         // The main validation ensures proper domain structure and PSL compliance
@@ -649,6 +725,10 @@ mod tests {
 
         // Verify mixed case
         let domain = ValidatedDomain::new("Example.Com").unwrap();
+        assert_eq!(domain.as_str(), "example.com");
+
+        // Verify trailing root dot is stripped (DNS-equivalent form)
+        let domain = ValidatedDomain::new("example.com.").unwrap();
         assert_eq!(domain.as_str(), "example.com");
     }
 

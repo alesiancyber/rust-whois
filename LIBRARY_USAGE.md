@@ -196,6 +196,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Shared Redis Cache (Multi-Instance Deployments)
+
+With the `redis-cache` feature, the in-process cache gains a shared Redis tier.
+Every instance sharing the Redis presents **one** cache to the upstream
+registries, so query volume (and rate-limit pressure) stays flat as you scale out.
+
+```toml
+[dependencies]
+whois-service = { version = "0.3", features = ["redis-cache"] }
+```
+
+```rust
+use std::sync::Arc;
+use whois_service::{Config, RedisCache, WhoisClient};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Arc::new(Config::load()?);
+    let backend = Arc::new(RedisCache::new("redis://127.0.0.1:6379")?);
+    let client = WhoisClient::new_with_cache_backend(config, backend).await?;
+
+    let result = client.lookup("example.com").await?;
+    println!("Server: {}", result.whois_server);
+    Ok(())
+}
+```
+
+Notes:
+- A Redis outage degrades gracefully to per-instance caching; lookups never fail because the backend is down.
+- Cache TTLs are status-aware: found records use `CACHE_TTL_SECONDS`, not-found uses `NEGATIVE_CACHE_TTL_SECONDS` (default 300s), and rate-limited responses are never cached.
+- The HTTP server binary picks this up automatically: build with `--features redis-cache` and set `REDIS_URL`.
+- Custom backends (memcached, a database, etc.) can implement the `CacheBackend` trait and plug in the same way.
+
 ## 🔄 Batch Processing
 
 ### Sequential Processing
@@ -456,7 +489,7 @@ pub enum WhoisError {
 
 The library uses a three-tier lookup system for **both domains and IP addresses**:
 
-1. **RDAP First** - Modern structured JSON responses (faster, 1,194 TLD mappings + 5 RIRs)
+1. **RDAP First** - Modern structured JSON responses (servers discovered live from IANA bootstrap data, plus the 5 RIRs for IPs)
 2. **WHOIS Fallback** - Traditional protocol for comprehensive coverage
 3. **Smart Caching** - In-memory cache for repeated lookups
 

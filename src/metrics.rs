@@ -95,7 +95,15 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 /// Simple TLD extraction for metrics labeling
 /// Uses the shared tld module's simple extraction (no PSL needed for metrics)
+///
+/// IP queries collapse to fixed "ipv4"/"ipv6" labels - labeling by the raw
+/// query would give one Prometheus series per distinct address (unbounded
+/// label cardinality; especially bad for IPv6, which has no dots at all).
 #[cfg(feature = "server")]
 fn extract_tld(domain: &str) -> String {
-    whois_service::tld::extract_tld_simple(domain)
+    match domain.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => "ipv4".to_string(),
+        Ok(std::net::IpAddr::V6(_)) => "ipv6".to_string(),
+        Err(_) => whois_service::tld::extract_tld_simple(domain),
+    }
 } 

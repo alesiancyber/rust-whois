@@ -27,11 +27,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 60;
 
 // Import from the library instead of local modules
 use whois_service::{
-    whois::WhoisService,
-    rdap::RdapService,
-    cache::CacheService,
     config::Config,
     errors::WhoisError,
+    WhoisClient,
     WhoisResponse,
     ValidatedQuery,
 };
@@ -58,7 +56,8 @@ mod metrics;
     ),
     info(
         title = "Whois Service API",
-        version = "0.2.0",
+        // version intentionally omitted - utoipa defaults it to the crate
+        // version, so it can't drift from Cargo.toml again
         description = "High-performance whois lookup service with RDAP support for cybersecurity applications. Supports domain names, IPv4, and IPv6 addresses. Features RDAP-first lookup with intelligent fallback to traditional whois.",
         contact(
             name = "Whois Service Support",
@@ -77,24 +76,12 @@ struct ApiDoc;
 
 #[derive(Clone)]
 pub struct AppState {
-    whois_service: Arc<WhoisService>,
-    rdap_service: Arc<RdapService>,
-    cache_service: Arc<CacheService>,
+    /// Library client: RDAP-first lookup with WHOIS fallback and built-in
+    /// caching/deduplication - the single source of truth for lookup tiering
+    client: WhoisClient,
     rate_limiter: Arc<whois_service::rate_limiter::RateLimiter>,
     /// Application start time for uptime tracking
     start_time: std::time::Instant,
-}
-
-/// Result from a three-tier lookup (RDAP -> WHOIS)
-struct LookupResult {
-    /// The server that provided the response (e.g., "RDAP: rdap.verisign.com")
-    server: String,
-    /// Raw response data from the server
-    raw_data: String,
-    /// Parsed/structured whois data (if parsing succeeded)
-    parsed_data: Option<whois_service::ParsedWhoisData>,
-    /// Debug information about the parsing process
-    parsing_analysis: Vec<String>,
 }
 
 /// Validate query (domain or IP) from query parameters (wrapper for metrics integration)
@@ -161,19 +148,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::load()?);
     info!("Configuration loaded successfully");
 
-    // Initialize services
-    let whois_service = Arc::new(WhoisService::new(config.clone()).await?);
-    let rdap_service = Arc::new(RdapService::new(config.clone()).await?);
-    let cache_service = Arc::new(CacheService::new(config.clone()));
+    // Initialize services. With the redis-cache feature and REDIS_URL set,
+    // the cache gains a shared Redis tier so a fleet of instances presents
+    // one cache to the upstream registries.
+    let client = build_client(config.clone()).await?;
     let rate_limiter = Arc::new(whois_service::rate_limiter::RateLimiter::new());
 
     // Initialize metrics
     metrics::init_metrics();
 
     let app_state = AppState {
-        whois_service,
-        rdap_service,
-        cache_service,
+        client,
         rate_limiter,
         start_time: std::time::Instant::now(),
     };
@@ -183,9 +168,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = Router::new()
         .route("/whois", get(whois_lookup))
         .route("/whois", post(whois_lookup_post))
-        .route("/whois/:domain", get(whois_lookup_path))  // Path-based route for easier testing
+        .route("/whois/{domain}", get(whois_lookup_path))  // Path-based route for easier testing
         .route("/whois/debug", get(whois_debug))
-        .route("/whois/debug/:domain", get(whois_debug_path))  // Path-based debug route
+        .route("/whois/debug/{domain}", get(whois_debug_path))  // Path-based debug route
         .route("/health", get(health_check))
         .route("/metrics", get(metrics::metrics_handler))
         .with_state(app_state);
@@ -240,148 +225,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// Three-tier lookup: RDAP -> WHOIS
-// Auto-detects whether the query is a domain or IP address
-async fn three_tier_lookup(
-    state: &AppState,
-    query: &str,
-) -> Result<LookupResult, WhoisError> {
-    use whois_service::DetectedQueryType;
-
-    // Auto-detect whether this is a domain or IP address
-    let validated = ValidatedQuery::new(query)?;
-
-    match validated.query_type() {
-        DetectedQueryType::Domain(_) => {
-            // Domain lookup: RDAP -> WHOIS fallback
-
-            // Tier 1: Try RDAP first (modern, structured JSON)
-            match state.rdap_service.lookup(query).await {
-                Ok(rdap_result) => {
-                    info!("✓ RDAP lookup successful for domain {}", query);
-                    return Ok(LookupResult {
-                        server: format!("RDAP: {}", rdap_result.server),
-                        raw_data: rdap_result.raw_data,
-                        parsed_data: rdap_result.parsed_data,
-                        parsing_analysis: rdap_result.parsing_analysis,
-                    });
-                }
-                Err(e) => {
-                    info!("⚠ RDAP lookup failed for domain {}: {} - falling back to WHOIS", query, e);
-                }
-            }
-
-            // Tier 2: Fallback to WHOIS (legacy but comprehensive)
-            match state.whois_service.lookup(query).await {
-                Ok(whois_result) => {
-                    info!("✓ WHOIS lookup successful for domain {}", query);
-                    Ok(LookupResult {
-                        server: format!("WHOIS: {}", whois_result.server),
-                        raw_data: whois_result.raw_data,
-                        parsed_data: whois_result.parsed_data,
-                        parsing_analysis: whois_result.parsing_analysis,
-                    })
-                }
-                Err(e) => {
-                    warn!("❌ Both RDAP and WHOIS lookups failed for domain {}", query);
-                    Err(e)
-                }
-            }
-        }
-        DetectedQueryType::IpAddress(_) => {
-            // IP address lookup: RDAP -> WHOIS fallback
-
-            // Tier 1: Try RDAP first (RIR RDAP servers)
-            match state.rdap_service.lookup_ip(query).await {
-                Ok(rdap_result) => {
-                    info!("✓ RDAP lookup successful for IP {}", query);
-                    return Ok(LookupResult {
-                        server: format!("RDAP: {}", rdap_result.server),
-                        raw_data: rdap_result.raw_data,
-                        parsed_data: rdap_result.parsed_data,
-                        parsing_analysis: rdap_result.parsing_analysis,
-                    });
-                }
-                Err(e) => {
-                    info!("⚠ RDAP lookup failed for IP {}: {} - falling back to WHOIS", query, e);
-                }
-            }
-
-            // Tier 2: Fallback to WHOIS (RIR WHOIS servers)
-            match state.whois_service.lookup_ip(query).await {
-                Ok(whois_result) => {
-                    info!("✓ WHOIS lookup successful for IP {}", query);
-                    Ok(LookupResult {
-                        server: format!("WHOIS: {}", whois_result.server),
-                        raw_data: whois_result.raw_data,
-                        parsed_data: whois_result.parsed_data,
-                        parsing_analysis: whois_result.parsing_analysis,
-                    })
-                }
-                Err(e) => {
-                    warn!("❌ Both RDAP and WHOIS lookups failed for IP {}", query);
-                    Err(e)
-                }
-            }
-        }
+/// Build the lookup client, attaching a shared Redis cache tier when the
+/// binary is compiled with `--features redis-cache` and REDIS_URL is set
+async fn build_client(config: Arc<Config>) -> Result<WhoisClient, WhoisError> {
+    #[cfg(feature = "redis-cache")]
+    if let Ok(url) = std::env::var("REDIS_URL") {
+        let backend = Arc::new(whois_service::RedisCache::new(&url)?);
+        info!("Using shared Redis cache tier at {}", url);
+        return WhoisClient::new_with_cache_backend(config, backend).await;
     }
+
+    WhoisClient::new_with_config(config).await
 }
 
 /// Core lookup logic - handles both domains and IP addresses
+///
+/// Delegates the RDAP -> WHOIS tiering, caching, and request deduplication to
+/// the library's WhoisClient so the binary and library can't drift apart.
 async fn perform_whois_lookup(
     state: &AppState,
     query: String,
     fresh: bool,
     include_debug: bool,
 ) -> Result<Json<WhoisResponse>, WhoisError> {
-    let start_time = std::time::Instant::now();
-
     // Increment request counter
     metrics::increment_requests(&query);
 
-    // For fresh or debug requests, bypass cache
-    if fresh || include_debug {
-        // Check rate limits (soft limits - log warnings but don't block)
-        if fresh && state.rate_limiter.check_fresh_query(&query) {
-            metrics::increment_errors("fresh_rate_limit_warning");
-        }
-        if include_debug && state.rate_limiter.check_debug_query(&query) {
-            metrics::increment_errors("debug_rate_limit_warning");
-        }
-
-        let result = three_tier_lookup(state, &query).await?;
-        let query_time = start_time.elapsed().as_millis() as u64;
-        let response = build_whois_response(query.clone(), result, query_time, include_debug);
-
-        metrics::increment_cache_misses();
-        metrics::record_query_time(query_time);
-
-        return Ok(Json(response));
+    // Check rate limits (soft limits - log warnings but don't block)
+    if fresh && state.rate_limiter.check_fresh_query(&query) {
+        metrics::increment_errors("fresh_rate_limit_warning");
+    }
+    if include_debug && state.rate_limiter.check_debug_query(&query) {
+        metrics::increment_errors("debug_rate_limit_warning");
     }
 
-    // Use cache with automatic query deduplication
-    // Multiple concurrent requests for same query will share the fetch operation
-    let response = state
-        .cache_service
-        .get_or_fetch(&query, || {
-            let state = state.clone();
-            let query = query.clone();
-            async move {
-                let result = three_tier_lookup(&state, &query).await?;
-                let query_time = start_time.elapsed().as_millis() as u64;
-                Ok(build_whois_response(query, result, query_time, false))
-            }
-        })
+    // Debug requests always bypass the cache so the analysis reflects a live parse
+    let mut response = state
+        .client
+        .lookup_with_options(&query, fresh || include_debug)
         .await?;
 
-    // Update metrics based on cache status
     if response.cached {
         metrics::increment_cache_hits();
     } else {
         metrics::increment_cache_misses();
     }
-
+    if response.lookup_status == whois_service::LookupStatus::RateLimited {
+        metrics::increment_errors("upstream_rate_limited");
+    }
     metrics::record_query_time(response.query_time_ms);
+
+    // Parsing analysis is debug-only output
+    if !include_debug {
+        response.parsing_analysis = None;
+    }
 
     Ok(Json(response))
 }
@@ -403,24 +300,6 @@ async fn whois_lookup(
 ) -> Result<Json<WhoisResponse>, WhoisError> {
     let validated = validate_query_with_metrics(&params.domain)?;
     perform_whois_lookup(&state, validated.into_inner(), params.fresh, false).await
-}
-
-// Helper function to build WhoisResponse - eliminates DRY violation
-fn build_whois_response(
-    query: String,
-    result: LookupResult,
-    query_time: u64,
-    include_debug: bool,
-) -> WhoisResponse {
-    WhoisResponse {
-        domain: query,  // Field name is 'domain' for backward compatibility, but holds domain or IP
-        whois_server: result.server,
-        raw_data: result.raw_data,
-        parsed_data: result.parsed_data,
-        cached: false,
-        query_time_ms: query_time,
-        parsing_analysis: if include_debug { Some(result.parsing_analysis) } else { None },
-    }
 }
 
 async fn whois_lookup_post(

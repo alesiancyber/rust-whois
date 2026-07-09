@@ -206,7 +206,7 @@ mod tests {
         let future_date = Utc::now() + chrono::Duration::days(5);
         let days = days_since(&future_date);
         // Allow for day boundary race conditions
-        assert!(days >= -5 && days <= -4);
+        assert!((-5..=-4).contains(&days));
 
         // Today
         let today = Utc::now();
@@ -220,13 +220,13 @@ mod tests {
         let future_date = Utc::now() + chrono::Duration::days(10);
         let days = days_until(&future_date);
         // Allow for day boundary race conditions (9-10 days is acceptable)
-        assert!(days >= 9 && days <= 10);
+        assert!((9..=10).contains(&days));
 
         // Date in the past (negative)
         let past_date = Utc::now() - chrono::Duration::days(5);
         let days = days_until(&past_date);
         // Allow for day boundary race conditions
-        assert!(days >= -5 && days <= -4);
+        assert!((-5..=-4).contains(&days));
 
         // Today
         let today = Utc::now();

@@ -5,7 +5,7 @@ A high-performance WHOIS/RDAP lookup service built in Rust for **internal automa
 ## Overview
 
 - **RDAP-first** with automatic WHOIS fallback for universal coverage
-- **1,194 TLD mappings** auto-generated from IANA bootstrap data at build time
+- **Dynamic TLD discovery** from live IANA data (RDAP bootstrap + root WHOIS referrals) with a self-healing runtime cache - no hardcoded server lists to go stale
 - **Domain and IP address lookups** (IPv4 and IPv6)
 - **Intelligent caching** with configurable TTL (avoids rate limiting)
 - **Calculated fields** for threat detection: `created_ago`, `updated_ago`, `expires_in`

@@ -1,6 +1,6 @@
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
-use crossbeam::queue::ArrayQueue;
+use crossbeam_queue::ArrayQueue;
 use tracing::debug;
 
 // Lock-free buffer pool using crossbeam's ArrayQueue
@@ -19,7 +19,7 @@ pub struct PooledBuffer {
 
 impl PooledBuffer {
     #[must_use]
-    pub fn new(pool: BufferPool, buffer_size: usize, _max_pool_size: usize) -> Self {
+    pub fn new(pool: BufferPool, buffer_size: usize) -> Self {
         let buffer = match pool.pop() {
             Some(mut buf) => {
                 // Reuse allocation if capacity is sufficient
